@@ -55,13 +55,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         f"{len(prompts)} prompts from {len(manager.get_server_names())} servers"
     )
 
-    # Mount MCP visibility hook if enabled
-    visibility_config = config.get("visibility", {})
-    if visibility_config.get("enabled", True):  # Default: enabled
+    # Mount MCP visibility hook if enabled AND servers exist
+    # Skip registration entirely when no servers - no point running a hook that does nothing
+    visibility_config = (config or {}).get("visibility", {})
+    server_names = manager.get_server_names()
+    if visibility_config.get("enabled", True) and server_names:
         from amplifier_module_tool_mcp.hooks import MCPVisibilityHook
-        
+
         hook = MCPVisibilityHook(manager, visibility_config)
-        
+
         # Register hook on provider:request event
         coordinator.hooks.register(
             event="provider:request",
@@ -69,8 +71,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             priority=hook.priority,
             name="mcp-visibility",
         )
-        
-        logger.info(f"Mounted MCP visibility hook with {len(manager.get_server_names())} servers")
+
+        logger.info(f"Mounted MCP visibility hook with {len(server_names)} servers")
 
     # Return cleanup function that properly shuts down connections
     async def cleanup():

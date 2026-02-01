@@ -47,14 +47,15 @@ class MCPManager:
         # Verbose server output configuration
         # Default: suppress server stderr (quiet by default)
         # Can be overridden via config or environment variable
-        self.verbose_servers = (
-            config.get("verbose_servers", False)
-            or os.environ.get("AMPLIFIER_MCP_VERBOSE", "").lower() in ("true", "1", "yes")
-        )
+        self.verbose_servers = config.get("verbose_servers", False) or os.environ.get(
+            "AMPLIFIER_MCP_VERBOSE", ""
+        ).lower() in ("true", "1", "yes")
 
         # Where to save server logs when suppressed
         default_log_dir = "~/.amplifier/logs/mcp-servers/"
-        self.server_log_dir = Path(config.get("server_log_dir", default_log_dir)).expanduser()
+        self.server_log_dir = Path(
+            config.get("server_log_dir", default_log_dir)
+        ).expanduser()
 
         # Content size limit to prevent context exhaustion
         self.max_content_size = config.get("max_content_size", DEFAULT_MAX_CONTENT_SIZE)
@@ -76,7 +77,7 @@ class MCPManager:
         servers = self.config.load_servers()
 
         if not servers:
-            logger.warning("No MCP servers configured - module will not provide any capabilities")
+            logger.debug("No MCP servers configured - MCP capabilities inactive")
             return
 
         # Start each server
@@ -92,7 +93,9 @@ class MCPManager:
             f"{len(self.prompts)} prompts from {len(self.clients)} servers"
         )
 
-    async def _start_server(self, server_name: str, server_config: dict[str, Any]) -> None:
+    async def _start_server(
+        self, server_name: str, server_config: dict[str, Any]
+    ) -> None:
         """
         Start a single MCP server and discover its capabilities.
 
@@ -108,7 +111,9 @@ class MCPManager:
         elif transport_type == "stdio":
             await self._start_stdio_server(server_name, server_config)
         else:
-            logger.error(f"Unknown transport type '{transport_type}' for server '{server_name}'")
+            logger.error(
+                f"Unknown transport type '{transport_type}' for server '{server_name}'"
+            )
 
     def _detect_transport_type(self, server_config: dict[str, Any]) -> str:
         """
@@ -124,7 +129,12 @@ class MCPManager:
         if "type" in server_config:
             transport = server_config["type"]
             # Normalize variations
-            if transport in ("streamable-http", "streamable_http", "streamablehttp", "http"):
+            if transport in (
+                "streamable-http",
+                "streamable_http",
+                "streamablehttp",
+                "http",
+            ):
                 return "streamable-http"
             return transport
 
@@ -139,14 +149,18 @@ class MCPManager:
         # Default to stdio
         return "stdio"
 
-    async def _start_stdio_server(self, server_name: str, server_config: dict[str, Any]) -> None:
+    async def _start_stdio_server(
+        self, server_name: str, server_config: dict[str, Any]
+    ) -> None:
         """Start a stdio-based MCP server."""
         command = server_config.get("command")
         args = server_config.get("args", [])
         env = server_config.get("env", {})
 
         if not command:
-            logger.error(f"Stdio server '{server_name}' missing 'command' in configuration")
+            logger.error(
+                f"Stdio server '{server_name}' missing 'command' in configuration"
+            )
             return
 
         # Substitute environment variables
@@ -154,7 +168,12 @@ class MCPManager:
 
         # Create and connect client with verbose settings
         client = MCPClient(
-            server_name, command, args, env, verbose_servers=self.verbose_servers, server_log_dir=self.server_log_dir
+            server_name,
+            command,
+            args,
+            env,
+            verbose_servers=self.verbose_servers,
+            server_log_dir=self.server_log_dir,
         )
         await client.connect()
 
@@ -162,13 +181,17 @@ class MCPManager:
         self.clients[server_name] = client
         await self._register_capabilities(server_name, client)
 
-    async def _start_streamable_http_server(self, server_name: str, server_config: dict[str, Any]) -> None:
+    async def _start_streamable_http_server(
+        self, server_name: str, server_config: dict[str, Any]
+    ) -> None:
         """Start a Streamable HTTP-based MCP server (2025-03-26 spec)."""
         url = server_config.get("url")
         headers = server_config.get("headers", {})
 
         if not url:
-            logger.error(f"Streamable HTTP server '{server_name}' missing 'url' in configuration")
+            logger.error(
+                f"Streamable HTTP server '{server_name}' missing 'url' in configuration"
+            )
             return
 
         # Substitute environment variables in headers
@@ -182,7 +205,9 @@ class MCPManager:
         self.clients[server_name] = client
         await self._register_capabilities(server_name, client)
 
-    async def _register_capabilities(self, server_name: str, client: MCPClient | MCPStreamableHTTPClient) -> None:
+    async def _register_capabilities(
+        self, server_name: str, client: MCPClient | MCPStreamableHTTPClient
+    ) -> None:
         """
         Register all capabilities (tools, resources, prompts) from a client.
 
@@ -193,42 +218,60 @@ class MCPManager:
         # Register tools - pass hooks for event emission and content size limit
         for tool_def in client.get_tools():
             wrapper = MCPToolWrapper(
-                server_name, tool_def, client, self.coordinator.hooks, max_content_size=self.max_content_size
+                server_name,
+                tool_def,
+                client,
+                self.coordinator.hooks,
+                max_content_size=self.max_content_size,
             )
             self.tools[wrapper.name] = wrapper
-            logger.debug(f"Registered tool '{wrapper.name}' from server '{server_name}'")
+            logger.debug(
+                f"Registered tool '{wrapper.name}' from server '{server_name}'"
+            )
 
         # Register resources - pass hooks for event emission and content size limit
         for resource_def in client.get_resources():
             wrapper = MCPResourceWrapper(
-                server_name, resource_def, client, self.coordinator.hooks, max_content_size=self.max_content_size
+                server_name,
+                resource_def,
+                client,
+                self.coordinator.hooks,
+                max_content_size=self.max_content_size,
             )
             self.resources[wrapper.name] = wrapper
-            logger.debug(f"Registered resource '{wrapper.name}' from server '{server_name}'")
+            logger.debug(
+                f"Registered resource '{wrapper.name}' from server '{server_name}'"
+            )
 
         # Register prompts - pass hooks for event emission and content size limit
         for prompt_def in client.get_prompts():
             wrapper = MCPPromptWrapper(
-                server_name, prompt_def, client, self.coordinator.hooks, max_content_size=self.max_content_size
+                server_name,
+                prompt_def,
+                client,
+                self.coordinator.hooks,
+                max_content_size=self.max_content_size,
             )
             self.prompts[wrapper.name] = wrapper
-            logger.debug(f"Registered prompt '{wrapper.name}' from server '{server_name}'")
+            logger.debug(
+                f"Registered prompt '{wrapper.name}' from server '{server_name}'"
+            )
 
     async def stop(self) -> None:
         """Stop all MCP servers cleanly."""
         logger.info("Stopping MCP manager...")
-        
+
         # Disconnect all servers in parallel
         await asyncio.gather(
             *[client.disconnect() for client in self.clients.values()],
-            return_exceptions=True
+            return_exceptions=True,
         )
-        
+
         self.clients.clear()
         self.tools.clear()
         self.resources.clear()
         self.prompts.clear()
-        
+
         logger.info("MCP manager stopped")
 
     def get_tools(self) -> dict[str, MCPToolWrapper]:
