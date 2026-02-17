@@ -49,7 +49,9 @@ class MCPResourceWrapper:
         self.resource_uri = resource_def["uri"]
         resource_name_clean = resource_def["name"].replace("/", "_").replace(":", "_")
         self._name = f"mcp_{server_name}_resource_{resource_name_clean}"
-        self._description = resource_def.get("description", f"Read resource: {resource_def['name']}")
+        self._description = resource_def.get(
+            "description", f"Read resource: {resource_def['name']}"
+        )
         self.mime_type = resource_def.get("mime_type")
 
     @property
@@ -122,10 +124,12 @@ class MCPResourceWrapper:
 
         except Exception as e:
             logger.error(f"MCP resource '{self.name}' read failed: {e}")
+            error_msg = str(e)
             return ToolResult(
                 success=False,
+                output=error_msg,
                 error={
-                    "message": str(e),
+                    "message": error_msg,
                     "mcp_server": self.server_name,
                     "mcp_resource": self.resource_uri,
                 },
@@ -151,7 +155,9 @@ class MCPResourceWrapper:
 
         # Apply size limit with truncation if needed
         context_info = f"MCP resource '{self.name}'"
-        content, was_truncated = truncate_content_if_needed(raw_content, self.max_content_size, context_info)
+        content, was_truncated = truncate_content_if_needed(
+            raw_content, self.max_content_size, context_info
+        )
 
         return content, was_truncated
 

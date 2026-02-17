@@ -47,7 +47,9 @@ class MCPPromptWrapper:
         # Extract prompt info
         self.prompt_name = prompt_def["name"]
         self._name = f"mcp_{server_name}_prompt_{self.prompt_name}"
-        self._description = prompt_def.get("description", f"Get prompt: {self.prompt_name}")
+        self._description = prompt_def.get(
+            "description", f"Get prompt: {self.prompt_name}"
+        )
         self.prompt_arguments = prompt_def.get("arguments", [])
 
     @property
@@ -121,10 +123,12 @@ class MCPPromptWrapper:
 
         except Exception as e:
             logger.error(f"MCP prompt '{self.name}' retrieval failed: {e}")
+            error_msg = str(e)
             return ToolResult(
                 success=False,
+                output=error_msg,
                 error={
-                    "message": str(e),
+                    "message": error_msg,
                     "mcp_server": self.server_name,
                     "mcp_prompt": self.prompt_name,
                 },
@@ -169,7 +173,9 @@ class MCPPromptWrapper:
 
         # Apply size limit with truncation if needed
         context_info = f"MCP prompt '{self.name}'"
-        messages, was_truncated = truncate_content_if_needed(raw_messages, self.max_content_size, context_info)
+        messages, was_truncated = truncate_content_if_needed(
+            raw_messages, self.max_content_size, context_info
+        )
 
         return messages, was_truncated
 

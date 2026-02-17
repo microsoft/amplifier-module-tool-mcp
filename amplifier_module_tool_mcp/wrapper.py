@@ -105,10 +105,12 @@ class MCPToolWrapper:
 
         except Exception as e:
             logger.error(f"MCP tool '{self.name}' failed: {e}")
+            error_msg = str(e)
             return ToolResult(
                 success=False,
+                output=error_msg,
                 error={
-                    "message": str(e),
+                    "message": error_msg,
                     "mcp_server": self.server_name,
                     "mcp_tool": self.tool_name,
                 },
@@ -134,7 +136,9 @@ class MCPToolWrapper:
 
         # Apply size limit with truncation if needed
         context_info = f"MCP tool '{self.name}'"
-        content, was_truncated = truncate_content_if_needed(raw_content, self.max_content_size, context_info)
+        content, was_truncated = truncate_content_if_needed(
+            raw_content, self.max_content_size, context_info
+        )
 
         return content, was_truncated
 
