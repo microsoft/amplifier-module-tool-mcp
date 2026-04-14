@@ -1,5 +1,7 @@
 """Tests for MCP tool wrapper."""
 
+import json
+
 import pytest
 from amplifier_core import ToolResult
 from amplifier_module_tool_mcp.wrapper import MCPToolWrapper
@@ -81,3 +83,35 @@ async def test_wrapper_error_handling(sample_tool_def, mock_hooks):
     assert result.success is False
     assert result.error is not None
     assert "message" in result.error
+
+
+@pytest.mark.asyncio
+async def test_tool_name_sanitization(mock_hooks):
+    """Test that tool names with special characters are sanitized."""
+    client = MockMCPClient()
+
+    tool_def = {
+        "name": "get user.info (v2)",
+        "description": "Get user info",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+    wrapper = MCPToolWrapper("test-server", tool_def, client, mock_hooks)
+
+    # Only a-zA-Z0-9_- should remain in the name
+    assert " " not in wrapper.name
+    assert "." not in wrapper.name
+    assert "(" not in wrapper.name
+    assert ")" not in wrapper.name
+    assert wrapper.name == "mcp_test-server_get_user_info__v2_"
+
+
+@pytest.mark.asyncio
+async def test_tool_input_schema_json_serializable(sample_tool_def, mock_hooks):
+    """Test that the tool input_schema is fully JSON-serializable."""
+    client = MockMCPClient()
+    wrapper = MCPToolWrapper("test-server", sample_tool_def, client, mock_hooks)
+
+    # Must not raise TypeError
+    serialized = json.dumps(wrapper.input_schema)
+    assert isinstance(serialized, str)

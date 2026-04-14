@@ -1,6 +1,7 @@
 """Tool wrapper that exposes MCP tools as Amplifier Tools."""
 
 import logging
+import re
 from typing import Any
 
 from amplifier_core import ToolResult
@@ -50,7 +51,8 @@ class MCPToolWrapper:
 
         # Extract tool info
         self.tool_name = tool_def["name"]
-        self._name = f"mcp_{server_name}_{self.tool_name}"
+        tool_name_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", self.tool_name)
+        self._name = f"mcp_{server_name}_{tool_name_clean}"
         self._description = tool_def.get("description", "")
         self._input_schema = tool_def.get("input_schema", {})
 

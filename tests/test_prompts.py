@@ -42,7 +42,11 @@ def sample_prompt_def():
         "description": "Perform systematic code review",
         "arguments": [
             {"name": "file_path", "description": "Path to file", "required": True},
-            {"name": "focus_area", "description": "Area to focus on", "required": False},
+            {
+                "name": "focus_area",
+                "description": "Area to focus on",
+                "required": False,
+            },
         ],
     }
 
@@ -90,7 +94,9 @@ async def test_prompt_wrapper_execute(sample_prompt_def, mock_hooks):
     wrapper = MCPPromptWrapper("test-server", sample_prompt_def, client, mock_hooks)
 
     # Execute prompt
-    result = await wrapper.execute({"file_path": "src/app.py", "focus_area": "security"})
+    result = await wrapper.execute(
+        {"file_path": "src/app.py", "focus_area": "security"}
+    )
 
     # Verify result is ToolResult
     assert isinstance(result, ToolResult)
@@ -100,7 +106,10 @@ async def test_prompt_wrapper_execute(sample_prompt_def, mock_hooks):
     assert "code_review" in result.output["messages"]
     assert client.call_count == 1
     assert client.last_prompt_name == "code_review"
-    assert client.last_arguments == {"file_path": "src/app.py", "focus_area": "security"}
+    assert client.last_arguments == {
+        "file_path": "src/app.py",
+        "focus_area": "security",
+    }
 
 
 @pytest.mark.asyncio
@@ -200,3 +209,24 @@ async def test_prompt_message_extraction(mock_hooks):
     assert "System message" in result.output["messages"]
     assert "[user]" in result.output["messages"]
     assert "User message" in result.output["messages"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_name_sanitization(mock_hooks):
+    """Test that prompt names with special characters are sanitized."""
+    client = MockMCPClient()
+
+    prompt_def = {
+        "name": "review code (v2.0)",
+        "description": "Code review prompt",
+        "arguments": [],
+    }
+
+    wrapper = MCPPromptWrapper("test-server", prompt_def, client, mock_hooks)
+
+    # Only a-zA-Z0-9_- should remain in the name
+    assert " " not in wrapper.name
+    assert "." not in wrapper.name
+    assert "(" not in wrapper.name
+    assert ")" not in wrapper.name
+    assert wrapper.name == "mcp_test-server_prompt_review_code__v2_0_"

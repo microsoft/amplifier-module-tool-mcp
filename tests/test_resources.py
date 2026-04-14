@@ -1,5 +1,7 @@
 """Tests for MCP resource wrapper."""
 
+import json
+
 import pytest
 from amplifier_core import ToolResult
 from amplifier_module_tool_mcp.resource_wrapper import MCPResourceWrapper
@@ -173,4 +175,68 @@ async def test_resource_content_extraction(mock_hooks):
     assert isinstance(result.output, dict)
     assert "content" in result.output
     assert "Text part" in result.output["content"]
-    assert "Binary content" in result.output["content"] or "blob" in result.output["content"].lower()
+    assert (
+        "Binary content" in result.output["content"]
+        or "blob" in result.output["content"].lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_name_sanitization_spaces(mock_hooks):
+    """Test that resource names with spaces are sanitized (regression for API rejection)."""
+    client = MockMCPClient()
+
+    resource_def = {
+        "uri": "senzing://resource/terms-of-service",
+        "name": "Terms of Service",
+        "description": "Senzing Terms of Service",
+    }
+
+    wrapper = MCPResourceWrapper("senzing", resource_def, client, mock_hooks)
+
+    # Spaces must be replaced - Anthropic requires ^[a-zA-Z0-9_-]{1,128}$
+    assert " " not in wrapper.name
+    assert wrapper.name == "mcp_senzing_resource_Terms_of_Service"
+
+
+@pytest.mark.asyncio
+async def test_resource_name_sanitization_special_chars(mock_hooks):
+    """Test that various special characters in resource names are sanitized."""
+    client = MockMCPClient()
+
+    resource_def = {
+        "uri": "file:///test",
+        "name": "my.resource (v2.1)",
+        "description": "Test",
+    }
+
+    wrapper = MCPResourceWrapper("test-server", resource_def, client, mock_hooks)
+
+    # Only a-zA-Z0-9_- should remain
+    assert "." not in wrapper.name
+    assert "(" not in wrapper.name
+    assert ")" not in wrapper.name
+    assert wrapper.name == "mcp_test-server_resource_my_resource__v2_1_"
+
+
+@pytest.mark.asyncio
+async def test_resource_input_schema_json_serializable(sample_resource_def, mock_hooks):
+    """Test that the resource input_schema is fully JSON-serializable.
+
+    Regression test: MCP SDK returns AnyUrl objects for resource URIs.
+    If str() conversion is removed from the client discovery code, the
+    schema default field would contain a non-serializable object, crashing
+    the session when the orchestrator sends tool definitions to the LLM.
+    """
+    client = MockMCPClient()
+    wrapper = MCPResourceWrapper("test-server", sample_resource_def, client, mock_hooks)
+
+    schema = wrapper.input_schema
+
+    # This must not raise TypeError
+    serialized = json.dumps(schema)
+    assert isinstance(serialized, str)
+
+    # The default URI value must be a plain string
+    default_uri = schema["properties"]["uri"]["default"]
+    assert isinstance(default_uri, str)

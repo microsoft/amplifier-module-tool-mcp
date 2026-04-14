@@ -187,7 +187,7 @@ class MCPStreamableHTTPClient:
             resources_result = await self.session.list_resources()
             self.resources = [
                 {
-                    "uri": resource.uri,
+                    "uri": str(resource.uri),
                     "name": resource.name,
                     "description": resource.description or "",
                     "mime_type": resource.mimeType if hasattr(resource, "mimeType") else None,

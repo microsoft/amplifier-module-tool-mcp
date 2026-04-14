@@ -1,6 +1,7 @@
 """Prompt wrapper that exposes MCP prompts as Amplifier Tools."""
 
 import logging
+import re
 from typing import Any
 
 from amplifier_core import ToolResult
@@ -46,7 +47,8 @@ class MCPPromptWrapper:
 
         # Extract prompt info
         self.prompt_name = prompt_def["name"]
-        self._name = f"mcp_{server_name}_prompt_{self.prompt_name}"
+        prompt_name_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", self.prompt_name)
+        self._name = f"mcp_{server_name}_prompt_{prompt_name_clean}"
         self._description = prompt_def.get(
             "description", f"Get prompt: {self.prompt_name}"
         )

@@ -1,6 +1,7 @@
 """Resource wrapper that exposes MCP resources as Amplifier Tools."""
 
 import logging
+import re
 from typing import Any
 
 from amplifier_core import ToolResult
@@ -47,7 +48,7 @@ class MCPResourceWrapper:
 
         # Extract resource info
         self.resource_uri = resource_def["uri"]
-        resource_name_clean = resource_def["name"].replace("/", "_").replace(":", "_")
+        resource_name_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", resource_def["name"])
         self._name = f"mcp_{server_name}_resource_{resource_name_clean}"
         self._description = resource_def.get(
             "description", f"Read resource: {resource_def['name']}"
