@@ -8,9 +8,12 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
+from amplifier_module_tool_mcp.errors import extract_root_cause
 from amplifier_module_tool_mcp.reconnection import CircuitBreaker
 from amplifier_module_tool_mcp.reconnection import ReconnectionConfig
 from amplifier_module_tool_mcp.reconnection import ReconnectionStrategy
+from amplifier_module_tool_mcp.sdk_compat import get_input_schema
+from amplifier_module_tool_mcp.sdk_compat import get_mime_type
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +21,6 @@ logger = logging.getLogger(__name__)
 # Guards against servers that accept TCP connections but never respond,
 # which would otherwise cause connect() to block indefinitely.
 CONNECTION_TIMEOUT = 30.0
-
-
-def _extract_root_cause(exc: BaseException) -> BaseException:
-    """Unwrap ExceptionGroup to the most informative root cause.
-
-    The MCP SDK's anyio TaskGroup surfaces transport errors as
-    ExceptionGroup("unhandled errors in a TaskGroup", [actual_error]).
-    Unwrapping gives callers the real cause (e.g. HTTPStatusError 502)
-    instead of the opaque ExceptionGroup string.
-
-    Available natively from Python 3.11; anyio produces ExceptionGroup
-    on earlier versions too via the exceptiongroup backport.
-    """
-    if isinstance(exc, ExceptionGroup) and exc.exceptions:
-        return _extract_root_cause(exc.exceptions[0])
-    return exc
 
 
 class MCPStreamableHTTPClient:
@@ -118,7 +105,7 @@ class MCPStreamableHTTPClient:
           this, a cancellation would bypass the ``_ready_event.set()`` call
           and leave ``connect()`` blocked forever.
 
-        * Calls ``_extract_root_cause()`` on the caught exception to unwrap
+        * Calls ``extract_root_cause()`` on the caught exception to unwrap
           ``ExceptionGroup`` values produced by anyio's TaskGroup.  This
           surfaces the real failure (e.g. "HTTP 502 Bad Gateway") instead of
           the opaque "unhandled errors in a TaskGroup (1 sub-exception)"
@@ -177,7 +164,7 @@ class MCPStreamableHTTPClient:
 
         except BaseException as e:
             # Unwrap anyio ExceptionGroup → real transport error for readable logs.
-            root_cause = _extract_root_cause(e)
+            root_cause = extract_root_cause(e)
 
             self._connection_error = root_cause
             self._connected = False
@@ -275,7 +262,7 @@ class MCPStreamableHTTPClient:
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "input_schema": tool.inputSchema,
+                "input_schema": get_input_schema(tool),
             }
             for tool in tools_result.tools
         ]
@@ -288,9 +275,7 @@ class MCPStreamableHTTPClient:
                     "uri": str(resource.uri),
                     "name": resource.name,
                     "description": resource.description or "",
-                    "mime_type": resource.mimeType
-                    if hasattr(resource, "mimeType")
-                    else None,
+                    "mime_type": get_mime_type(resource),
                 }
                 for resource in resources_result.resources
             ]

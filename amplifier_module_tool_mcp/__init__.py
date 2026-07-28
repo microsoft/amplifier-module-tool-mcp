@@ -16,7 +16,7 @@ from amplifier_core import ModuleCoordinator
 
 from amplifier_module_tool_mcp.manager import MCPManager
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __all__ = ["mount", "MCPManager"]
 
 logger = logging.getLogger(__name__)
