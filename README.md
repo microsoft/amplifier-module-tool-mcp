@@ -16,7 +16,7 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 
 **Production Proven:** 60 capabilities from 5 MCP servers (41 tools + 19 prompts)
 
-**Status:** ✅ Production Ready | **Version:** 0.2.2 | **Tests:** 52/52 passing
+**Status:** ✅ Production Ready | **Version:** 0.2.3 | **Tests:** 71/71 passing
 
 ---
 

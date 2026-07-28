@@ -10,9 +10,12 @@ from mcp import ClientSession
 from mcp import StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from amplifier_module_tool_mcp.errors import extract_root_cause
 from amplifier_module_tool_mcp.reconnection import CircuitBreaker
 from amplifier_module_tool_mcp.reconnection import ReconnectionConfig
 from amplifier_module_tool_mcp.reconnection import ReconnectionStrategy
+from amplifier_module_tool_mcp.sdk_compat import get_input_schema
+from amplifier_module_tool_mcp.sdk_compat import get_mime_type
 
 logger = logging.getLogger(__name__)
 
@@ -194,13 +197,19 @@ class MCPClient:
             # ``session.initialize()`` or ``_discover_capabilities()`` would
             # bypass the ``_ready_event.set()`` call and leave ``connect()``
             # blocked forever (mirrors the fix in streamable_http_client.py).
-            self._connection_error = e
+            # Unwrap anyio ExceptionGroup -> real error for readable logs.
+            # Without this, ``str()`` on the group yields only "unhandled
+            # errors in a TaskGroup (1 sub-exception)" and the actual failure
+            # is invisible (mirrors streamable_http_client.py).
+            root_cause = extract_root_cause(e)
+
+            self._connection_error = root_cause
             self._state = ConnectionState.ERROR
 
             # Only record as _last_error / circuit-breaker failure for
             # genuine transport errors, not for external task cancellation.
             if not isinstance(e, asyncio.CancelledError):
-                self._last_error = e if isinstance(e, Exception) else None
+                self._last_error = root_cause if isinstance(root_cause, Exception) else None
                 self._circuit_breaker.record_failure()
 
             # Always unblock connect() so it never hangs.
@@ -210,7 +219,9 @@ class MCPClient:
                 logger.debug(f"Connection task for '{self.server_name}' was cancelled")
             else:
                 # Include log file location in error message if suppressed
-                error_msg = f"Failed to connect to MCP server '{self.server_name}': {e}"
+                error_msg = (
+                    f"Failed to connect to MCP server '{self.server_name}': {root_cause}"
+                )
                 if not self.verbose_servers:
                     log_file_path = self.server_log_dir / f"{self.server_name}.log"
                     error_msg += f"\nServer logs available at: {log_file_path}"
@@ -318,7 +329,7 @@ class MCPClient:
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "input_schema": tool.inputSchema,
+                "input_schema": get_input_schema(tool),
             }
             for tool in tools_result.tools
         ]
@@ -331,7 +342,7 @@ class MCPClient:
                     "uri": str(resource.uri),
                     "name": resource.name,
                     "description": resource.description or "",
-                    "mime_type": resource.mimeType if hasattr(resource, "mimeType") else None,
+                    "mime_type": get_mime_type(resource),
                 }
                 for resource in resources_result.resources
             ]

@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-tool-mcp"
-version = "0.2.2"
+version = "0.2.3"
 description = "MCP (Model Context Protocol) tool module for Amplifier"
 license = "MIT"
 readme = "README.md"
@@ -9,7 +9,10 @@ authors = [
     { name = "Brian Krabach" },
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # 1.24.0 is the first release exposing mcp.client.streamable_http
+    # .streamable_http_client, which streamable_http_client.py imports
+    # unconditionally. Anything older fails at import time.
+    "mcp>=1.24.0",
     "pydantic>=2.0",
 ]
 
