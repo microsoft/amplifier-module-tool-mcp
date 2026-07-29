@@ -1,3 +1,17 @@
+> **HISTORICAL SNAPSHOT — DO NOT PLAN FROM THIS DOCUMENT.**
+>
+> This is a mid-development snapshot from **2025-10-18**. It describes the module as it
+> was during initial development, not as it exists today. Features it lists as missing or
+> planned have since been implemented, and it targets MCP spec revision 2025-03-26, which
+> the module no longer targets.
+>
+> For the current state of the module against the MCP **2026-07-28** specification, see
+> [`GAP_ANALYSIS.md`](GAP_ANALYSIS.md) (dated 2026-07-29).
+>
+> Retained as development history only.
+
+---
+
 # MCP Module - Completion Roadmap
 
 **Current Status**: Production Alpha (stdio transport fully working)

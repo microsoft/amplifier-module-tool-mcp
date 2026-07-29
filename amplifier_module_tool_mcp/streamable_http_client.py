@@ -1,4 +1,9 @@
-"""Streamable HTTP transport MCP client (2025-03-26 spec)."""
+"""Streamable HTTP transport MCP client.
+
+Protocol version handling (which MCP spec revision is negotiated during
+the handshake) is delegated entirely to the underlying `mcp` SDK; this
+module does not pin or assume a specific spec version.
+"""
 
 import asyncio
 import logging
@@ -8,9 +13,28 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
-from amplifier_module_tool_mcp.reconnection import CircuitBreaker
-from amplifier_module_tool_mcp.reconnection import ReconnectionConfig
-from amplifier_module_tool_mcp.reconnection import ReconnectionStrategy
+from amplifier_module_tool_mcp.discovery import (
+    discover_prompts,
+    discover_resources,
+    discover_tools,
+)
+from amplifier_module_tool_mcp.reconnection import (
+    CircuitBreaker,
+    ReconnectionConfig,
+    ReconnectionStrategy,
+)
+from amplifier_module_tool_mcp.sdk_compat import (
+    MCP_ERROR_CLASS,
+    MCPProtocolError,
+    MRTRNotSupportedError,
+    build_client_info,
+    describe_mcp_error,
+    extract_root_cause,
+    is_modern_protocol_version,
+    is_mrtr_unsupported_error,
+    negotiate,
+    supports_log_level_kwarg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,29 +44,14 @@ logger = logging.getLogger(__name__)
 CONNECTION_TIMEOUT = 30.0
 
 
-def _extract_root_cause(exc: BaseException) -> BaseException:
-    """Unwrap ExceptionGroup to the most informative root cause.
-
-    The MCP SDK's anyio TaskGroup surfaces transport errors as
-    ExceptionGroup("unhandled errors in a TaskGroup", [actual_error]).
-    Unwrapping gives callers the real cause (e.g. HTTPStatusError 502)
-    instead of the opaque ExceptionGroup string.
-
-    Available natively from Python 3.11; anyio produces ExceptionGroup
-    on earlier versions too via the exceptiongroup backport.
-    """
-    if isinstance(exc, ExceptionGroup) and exc.exceptions:
-        return _extract_root_cause(exc.exceptions[0])
-    return exc
-
-
 class MCPStreamableHTTPClient:
     """
-    MCP client using Streamable HTTP transport (2025-03-26 spec).
+    MCP client using Streamable HTTP transport.
 
-    This is the newer HTTP transport that replaces HTTP+SSE in the
-    latest MCP specification. It uses a single endpoint for both
-    POST and GET requests with optional SSE streaming.
+    This is the HTTP transport that replaces HTTP+SSE in newer MCP
+    specifications. It uses a single endpoint for both POST and GET
+    requests with optional SSE streaming. Protocol version negotiation
+    is handled entirely by the underlying `mcp` SDK.
     """
 
     def __init__(
@@ -70,6 +79,17 @@ class MCPStreamableHTTPClient:
         self.prompts: list[dict[str, Any]] = []
         self._connected = False
 
+        # Negotiated protocol version (e.g. "2026-07-28", or a legacy
+        # handshake version like "2025-03-26"). None until connect() has
+        # run at least once. See `protocol_version` property.
+        self._protocol_version: str | None = None
+
+        # Desired log level, cached for the *next* ClientSession
+        # construction. `logging/setLevel` was removed in 2026-07-28; on a
+        # modern-negotiated session, log level can only be set at
+        # ClientSession construction time (see `set_logging_level`).
+        self._log_level: str | None = None
+
         # Background task for connection lifecycle
         self._connection_task: asyncio.Task | None = None
         self._ready_event = asyncio.Event()
@@ -87,6 +107,11 @@ class MCPStreamableHTTPClient:
     def is_connected(self) -> bool:
         """Check if client is connected."""
         return self._connected
+
+    @property
+    def protocol_version(self) -> str | None:
+        """Negotiated MCP protocol version (e.g. "2026-07-28"), or None before connect()."""
+        return self._protocol_version
 
     @property
     def health_status(self) -> dict[str, Any]:
@@ -118,7 +143,7 @@ class MCPStreamableHTTPClient:
           this, a cancellation would bypass the ``_ready_event.set()`` call
           and leave ``connect()`` blocked forever.
 
-        * Calls ``_extract_root_cause()`` on the caught exception to unwrap
+        * Calls ``extract_root_cause()`` on the caught exception to unwrap
           ``ExceptionGroup`` values produced by anyio's TaskGroup.  This
           surfaces the real failure (e.g. "HTTP 502 Bad Gateway") instead of
           the opaque "unhandled errors in a TaskGroup (1 sub-exception)"
@@ -151,8 +176,27 @@ class MCPStreamableHTTPClient:
                             f"{len(conn)}-tuple (expected 2 or 3)"
                         )
 
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
+                    # Build ClientSession kwargs. `client_info` identifies
+                    # this module (rather than the SDK's own "mcp/0.1.0"
+                    # placeholder) to the server on both SDK majors.
+                    # `log_level` is only accepted by mcp>=2.0 -- pass it
+                    # only when supported and a level has been requested via
+                    # a prior set_logging_level() call.
+                    session_kwargs: dict[str, Any] = {
+                        "client_info": build_client_info()
+                    }
+                    if self._log_level is not None and supports_log_level_kwarg():
+                        session_kwargs["log_level"] = self._log_level
+
+                    async with ClientSession(read, write, **session_kwargs) as session:
+                        # Negotiate protocol version. On mcp>=2.0 this drives
+                        # the full modern stateless handshake (server/discover
+                        # + automatic legacy fallback); on mcp<2.0 (no
+                        # negotiate_auto) it falls back to the legacy
+                        # initialize() and logs that degradation once.
+                        self._protocol_version = await negotiate(
+                            session, server_name=self.server_name
+                        )
 
                         self.session = session
                         await self._discover_capabilities()
@@ -163,7 +207,8 @@ class MCPStreamableHTTPClient:
 
                         logger.info(
                             f"Connected to Streamable HTTP MCP server '{self.server_name}' "
-                            f"at {self.url} - discovered {len(self.tools)} tools, "
+                            f"at {self.url} (protocol {self._protocol_version or 'unknown'}) - "
+                            f"discovered {len(self.tools)} tools, "
                             f"{len(self.resources)} resources, {len(self.prompts)} prompts"
                         )
 
@@ -177,7 +222,7 @@ class MCPStreamableHTTPClient:
 
         except BaseException as e:
             # Unwrap anyio ExceptionGroup → real transport error for readable logs.
-            root_cause = _extract_root_cause(e)
+            root_cause = extract_root_cause(e)
 
             self._connection_error = root_cause
             self._connected = False
@@ -265,60 +310,23 @@ class MCPStreamableHTTPClient:
             )
 
     async def _discover_capabilities(self) -> None:
-        """Discover tools, resources, and prompts from server."""
+        """Discover tools, resources, and prompts from server.
+
+        Delegates to `amplifier_module_tool_mcp.discovery`, which follows
+        pagination cursors to completion (a server returning `nextCursor`
+        is no longer silently truncated) and is shared verbatim with
+        `MCPClient` (stdio transport) so both transports stay in lockstep.
+        """
         if not self.session:
             return
 
-        # Discover tools
-        tools_result = await self.session.list_tools()
-        self.tools = [
-            {
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": tool.inputSchema,
-            }
-            for tool in tools_result.tools
-        ]
-
-        # Discover resources
-        try:
-            resources_result = await self.session.list_resources()
-            self.resources = [
-                {
-                    "uri": str(resource.uri),
-                    "name": resource.name,
-                    "description": resource.description or "",
-                    "mime_type": resource.mimeType
-                    if hasattr(resource, "mimeType")
-                    else None,
-                }
-                for resource in resources_result.resources
-            ]
-        except Exception as e:
-            logger.debug(f"Server '{self.server_name}' does not support resources: {e}")
-            self.resources = []
-
-        # Discover prompts
-        try:
-            prompts_result = await self.session.list_prompts()
-            self.prompts = [
-                {
-                    "name": prompt.name,
-                    "description": prompt.description or "",
-                    "arguments": [
-                        {
-                            "name": arg.name,
-                            "description": arg.description or "",
-                            "required": arg.required,
-                        }
-                        for arg in (prompt.arguments or [])
-                    ],
-                }
-                for prompt in prompts_result.prompts
-            ]
-        except Exception as e:
-            logger.debug(f"Server '{self.server_name}' does not support prompts: {e}")
-            self.prompts = []
+        self.tools = await discover_tools(self.session)
+        self.resources = await discover_resources(
+            self.session, server_name=self.server_name
+        )
+        self.prompts = await discover_prompts(
+            self.session, server_name=self.server_name
+        )
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
@@ -330,9 +338,47 @@ class MCPStreamableHTTPClient:
             self._circuit_breaker.record_success()
             return result
 
+        except MCP_ERROR_CLASS as e:
+            # A well-formed JSON-RPC protocol error -- the server understood
+            # the request and rejected it with a real error code. Preserve
+            # code/message/data/explanation via MCPProtocolError so callers
+            # (wrapper.py) can distinguish this from a transport failure.
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Tool call failed for '{tool_name}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Tool execution failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
+
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
+
+            if is_mrtr_unsupported_error(e):
+                # The SDK's own message here ("pass allow_input_required=True
+                # ... retry call_tool(..., input_responses=...)") is not
+                # actionable by this caller -- this module exposes no such
+                # parameters. Replace it with an honest statement of what
+                # actually happened rather than an instruction the caller
+                # cannot follow.
+                message = (
+                    f"MCP server '{self.server_name}' requires interactive "
+                    f"input (MRTR / InputRequiredResult) to complete tool "
+                    f"'{tool_name}'. This module does not yet support the "
+                    f"multi-round-trip input protocol -- the call cannot be "
+                    f"completed."
+                )
+                logger.error(message)
+                raise MRTRNotSupportedError(message) from e
+
             logger.error(
                 f"Tool call failed for '{tool_name}' on '{self.server_name}': {e}"
             )
@@ -347,6 +393,22 @@ class MCPStreamableHTTPClient:
             result = await self.session.read_resource(uri=uri)
             self._circuit_breaker.record_success()
             return result
+
+        except MCP_ERROR_CLASS as e:
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Resource read failed for '{uri}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Resource read failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
 
         except Exception as e:
             self._circuit_breaker.record_failure()
@@ -368,6 +430,22 @@ class MCPStreamableHTTPClient:
             self._circuit_breaker.record_success()
             return result
 
+        except MCP_ERROR_CLASS as e:
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Get prompt failed for '{name}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Get prompt failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
+
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
@@ -375,7 +453,34 @@ class MCPStreamableHTTPClient:
             raise RuntimeError(f"Get prompt failed: {e}") from e
 
     async def set_logging_level(self, level: str) -> None:
-        """Set the logging level for the MCP server."""
+        """Set the logging level for the MCP server.
+
+        `logging/setLevel` was removed from the protocol in 2026-07-28; log
+        level is now negotiated once per session (via `_meta` on every
+        request, driven by `ClientSession(log_level=...)`), not set via a
+        standalone RPC.
+
+        On a legacy-negotiated session, the old RPC is still correct and is
+        sent as before. On a modern-negotiated session, the requested level
+        is cached for the *next* connection (passed to `ClientSession` at
+        construction) and this raises rather than silently no-op-ing or
+        sending a method the server has every right to reject.
+        """
+        if is_modern_protocol_version(self._protocol_version):
+            self._log_level = level
+            logger.info(
+                f"Cached log level '{level}' for server '{self.server_name}' -- "
+                f"will apply on the next connection via ClientSession(log_level=...)."
+            )
+            raise RuntimeError(
+                f"Cannot change logging level on an active modern-protocol "
+                f"({self._protocol_version}) session for '{self.server_name}': "
+                f"'logging/setLevel' was removed in 2026-07-28. The requested "
+                f"level {level!r} has been cached and will take effect on the "
+                f"next reconnect. To apply it now, call disconnect() then "
+                f"connect() again."
+            )
+
         if not self._connected or not self.session:
             await self.connect()
 

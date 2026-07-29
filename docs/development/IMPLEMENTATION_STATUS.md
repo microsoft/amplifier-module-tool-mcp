@@ -1,3 +1,17 @@
+> **HISTORICAL SNAPSHOT — DO NOT PLAN FROM THIS DOCUMENT.**
+>
+> This is an early-development snapshot describing "Phase 1 Complete" at commit
+> `5657647`, from the same 2025-10-18 development era as the other documents in this
+> directory. It does not describe the module as it exists today: the transports,
+> primitives, and SDK behavior it describes have all since changed.
+>
+> For the current state of the module against the MCP **2026-07-28** specification, see
+> [`GAP_ANALYSIS.md`](../GAP_ANALYSIS.md) (dated 2026-07-29).
+>
+> Retained as development history only.
+
+---
+
 # MCP Tool Module - Implementation Status
 
 **Repository**: `amplifier-module-tool-mcp`

@@ -8,15 +8,43 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 
 **What You Get:**
 - 🔌 **Multi-server orchestration** - Connect to multiple MCP servers simultaneously
-- 🚀 **Dual transport support** - stdio and Streamable HTTP (2025-03-26 MCP spec)
+- 🚀 **Dual transport support** - stdio and Streamable HTTP
 - 🔄 **Auto-reconnection** - Exponential backoff with circuit breaker for resilience
 - 🛡️ **Content protection** - Automatic truncation to prevent context exhaustion
 - 📊 **Health monitoring** - Track server status and connection health
 - 🔇 **Clean console** - Server logs saved to files, not cluttering output
 
-**Production Proven:** 60 capabilities from 5 MCP servers (41 tools + 19 prompts)
+**Version:** 0.2.2
 
-**Status:** ✅ Production Ready | **Version:** 0.2.2 | **Tests:** 52/52 passing
+## Protocol and SDK support
+
+The MCP spec revision this module speaks is determined by the installed `mcp` SDK:
+
+| Installed SDK | Protocol negotiated |
+|---|---|
+| `mcp>=2.0` | **2026-07-28** — the stateless protocol. Negotiated via `server/discover`; no `initialize` handshake; every request carries `_meta`. |
+| `mcp>=1.24,<2` | Handshake-era protocol (2025-11-25 on `mcp` 1.29.0), negotiated via `initialize`. The degradation is logged once per process at WARNING. |
+
+`mcp<1.24` is not supported — the `streamable_http_client` symbol does not exist under
+that name in earlier releases, so the module fails at import.
+
+**This is not full 2026-07-28 conformance.** On `mcp>=2.0` the module negotiates and
+speaks protocol 2026-07-28 — `server/discover` era detection, `_meta` on every request,
+the required HTTP headers, cursor-following pagination — but several obligations are
+not implemented, including one the spec makes a client **MUST**:
+
+- `x-mcp-header` mirroring and the `tools/list` exclusion rule it implies (a client MUST)
+- `resultType` handling and MRTR / elicitation
+- `subscriptions/listen` and all server→client notification handling
+- cache hints (`ttlMs` / `cacheScope`)
+- OAuth authorization (static config headers only)
+
+Note also that under Amplifier's default logging configuration only WARNING and above
+is shown, so the negotiated protocol version — logged at INFO — is not visible to the
+user unless the connection degraded to the legacy handshake.
+
+See [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) for the per-obligation conformance
+table, what was actually executed to verify it, and what remains unverified.
 
 ---
 
@@ -394,11 +422,14 @@ uv run pytest tests/ --cov=amplifier_module_tool_mcp --cov-report=html
 
 ## Documentation
 
-See complete documentation in:
-- `EXECUTIVE_SUMMARY.md` - Overview and status
-- `SDK_CAPABILITIES.md` - What the SDK provides
-- `GAP_ANALYSIS.md` - Feature analysis
-- `PHASE4_SUMMARY.md` - Latest features
+- [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) — current conformance status against
+  the MCP 2026-07-28 specification: what is implemented, what is not, and what is
+  deliberately excluded.
+- [`CONTENT_SIZE_PROTECTION.md`](CONTENT_SIZE_PROTECTION.md) — how oversized tool
+  results are truncated.
+
+Other files under `docs/` are 2025-10-18 development-era snapshots. Each carries a
+header saying so; they are retained as history and should not be used for planning.
 
 ---
 

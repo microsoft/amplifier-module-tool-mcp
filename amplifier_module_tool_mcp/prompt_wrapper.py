@@ -10,6 +10,7 @@ from amplifier_module_tool_mcp.content_utils import (
     DEFAULT_MAX_CONTENT_SIZE,
     truncate_content_if_needed,
 )
+from amplifier_module_tool_mcp.sdk_compat import MCPProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,25 @@ class MCPPromptWrapper:
                     "mcp_prompt": self.prompt_name,
                     "content_size_chars": len(messages),
                     "content_truncated": was_truncated,
+                },
+            )
+
+        except MCPProtocolError as e:
+            logger.error(
+                f"MCP prompt '{self.name}' retrieval failed with protocol error "
+                f"{e.code}: {e.explanation}"
+            )
+            error_msg = str(e)
+            return ToolResult(
+                success=False,
+                output=error_msg,
+                error={
+                    "message": error_msg,
+                    "mcp_server": self.server_name,
+                    "mcp_prompt": self.prompt_name,
+                    "mcp_error_code": e.code,
+                    "mcp_error_data": e.data,
+                    "mcp_error_explanation": e.explanation,
                 },
             )
 
