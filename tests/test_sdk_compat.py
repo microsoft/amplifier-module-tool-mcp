@@ -12,8 +12,10 @@ from mcp.types import ErrorData
 from amplifier_module_tool_mcp.sdk_compat import (
     MCP_ERROR_CLASS,
     MCPProtocolError,
+    MRTRNotSupportedError,
     describe_mcp_error,
     is_modern_protocol_version,
+    is_mrtr_unsupported_error,
     sdk_field,
 )
 
@@ -173,3 +175,34 @@ def test_is_modern_protocol_version_none_is_false():
 
 def test_is_modern_protocol_version_unknown_legacy_version_is_false():
     assert is_modern_protocol_version("2025-03-26") is False
+
+
+# ---------------------------------------------------------------------------
+# MRTR (InputRequiredResult) unsupported-guard detection
+# ---------------------------------------------------------------------------
+
+
+def test_is_mrtr_unsupported_error_detects_sdk_message():
+    """The bare RuntimeError mcp>=2.0 raises when a server returns
+    InputRequiredResult and allow_input_required was not passed.
+    """
+    exc = RuntimeError(
+        "Server returned InputRequiredResult; pass allow_input_required=True "
+        "to receive it and retry call_tool(..., input_responses=..., "
+        "request_state=result.request_state)."
+    )
+    assert is_mrtr_unsupported_error(exc) is True
+
+
+def test_is_mrtr_unsupported_error_false_for_unrelated_runtime_error():
+    assert is_mrtr_unsupported_error(RuntimeError("connection reset")) is False
+
+
+def test_is_mrtr_unsupported_error_false_for_non_runtime_error():
+    assert is_mrtr_unsupported_error(ValueError("InputRequiredResult")) is False
+
+
+def test_mrtr_not_supported_error_is_a_runtime_error():
+    err = MRTRNotSupportedError("MCP server requires interactive input (MRTR).")
+    assert isinstance(err, RuntimeError)
+    assert "MRTR" in str(err)

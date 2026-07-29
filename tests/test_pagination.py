@@ -132,6 +132,31 @@ async def test_collect_paginated_empty_string_cursor_is_followed_not_terminal():
 
 
 @pytest.mark.asyncio
+async def test_collect_paginated_missing_cursor_field_raises():
+    """A page carrying NEITHER `next_cursor` nor `nextCursor` is an
+    unrecognized SDK shape and must raise -- not be silently treated as a
+    terminal page.
+
+    Regression test for BLOCKER 1: `sdk_field(result, "next_cursor",
+    "nextCursor", default=None)` used to swallow this case, returning
+    `None` and making `collect_paginated` conclude "no more pages" --
+    silently truncating the result set with zero exception, zero log
+    line, at any level. `sdk_field` must be called with no `default=` so
+    the natural `AttributeError` propagates.
+    """
+
+    @dataclass
+    class _PageWithNoCursorField:
+        items: list
+
+    async def fetch(cursor: str | None) -> _PageWithNoCursorField:
+        return _PageWithNoCursorField(items=["only-page"])
+
+    with pytest.raises(AttributeError, match="next_cursor"):
+        await collect_paginated(fetch, "items", context="test")
+
+
+@pytest.mark.asyncio
 async def test_collect_paginated_repeated_cursor_raises():
     """A server returning the same cursor forever is a non-terminating loop, not data."""
     pages = {

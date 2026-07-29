@@ -23,14 +23,28 @@ The MCP spec revision this module speaks is determined by the installed `mcp` SD
 | Installed SDK | Protocol negotiated |
 |---|---|
 | `mcp>=2.0` | **2026-07-28** — the stateless protocol. Negotiated via `server/discover`; no `initialize` handshake; every request carries `_meta`. |
-| `mcp>=1.24,<2` | Handshake-era protocol (2025-11-25 on `mcp` 1.29.0), negotiated via `initialize`. The degradation is logged once per process at INFO. |
+| `mcp>=1.24,<2` | Handshake-era protocol (2025-11-25 on `mcp` 1.29.0), negotiated via `initialize`. The degradation is logged once per process at WARNING. |
 
 `mcp<1.24` is not supported — the `streamable_http_client` symbol does not exist under
 that name in earlier releases, so the module fails at import.
 
-Several 2026-07-28 obligations are not yet implemented, including
-`subscriptions/listen`, MRTR/elicitation, cache hints, and `x-mcp-header` mirroring.
-See [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) for the full conformance status.
+**This is not full 2026-07-28 conformance.** On `mcp>=2.0` the module negotiates and
+speaks protocol 2026-07-28 — `server/discover` era detection, `_meta` on every request,
+the required HTTP headers, cursor-following pagination — but several obligations are
+not implemented, including one the spec makes a client **MUST**:
+
+- `x-mcp-header` mirroring and the `tools/list` exclusion rule it implies (a client MUST)
+- `resultType` handling and MRTR / elicitation
+- `subscriptions/listen` and all server→client notification handling
+- cache hints (`ttlMs` / `cacheScope`)
+- OAuth authorization (static config headers only)
+
+Note also that under Amplifier's default logging configuration only WARNING and above
+is shown, so the negotiated protocol version — logged at INFO — is not visible to the
+user unless the connection degraded to the legacy handshake.
+
+See [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) for the per-obligation conformance
+table, what was actually executed to verify it, and what remains unverified.
 
 ---
 

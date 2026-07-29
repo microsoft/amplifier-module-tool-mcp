@@ -153,15 +153,18 @@ def _warn_legacy_negotiation_once(server_name: str) -> None:
 
     This is a real, visible protocol degradation (no `server/discover`, no
     `_meta` on requests, a 2025-03-26-era wire format) caused by an installed
-    `mcp` SDK that predates `negotiate_auto` (i.e. `mcp<2.0`). Logged at INFO
-    exactly once per process so operators can tell which protocol era their
-    connections are actually speaking without spamming logs per-connection.
+    `mcp` SDK that predates `negotiate_auto` (i.e. `mcp<2.0`). Logged at
+    WARNING exactly once per process -- not INFO -- because Python's
+    effective default log level with no configuration is WARNING: a host
+    app that never explicitly raises its log level would otherwise never
+    see this message at all, and would silently run a handshake-era
+    protocol forever without any visible signal that it's degraded.
     """
     global _legacy_negotiation_warned
     if _legacy_negotiation_warned:
         return
     _legacy_negotiation_warned = True
-    logger.info(
+    logger.warning(
         f"MCP server '{server_name}': installed `mcp` SDK predates modern "
         f"protocol negotiation (`negotiate_auto` is not importable from "
         f"mcp.client.client -- this is expected for mcp<2.0). Falling back "
@@ -426,3 +429,57 @@ class MCPProtocolError(RuntimeError):
         self.message = message
         self.data = data
         self.explanation = explanation
+
+
+# ---------------------------------------------------------------------------
+# MRTR (Multi Round-Trip Requests) -- unsupported, but must fail honestly
+# ---------------------------------------------------------------------------
+#
+# `mcp>=2.0` added MRTR: a server may answer `tools/call` / `prompts/get` /
+# `resources/read` with `InputRequiredResult` instead of the normal result,
+# asking the client to supply sampling/elicitation/roots input and retry.
+# Wiring MRTR end-to-end is a real design effort (see docs/GAP_ANALYSIS.md
+# §5.2) -- there is no established pattern yet for how an Amplifier agent
+# produces that answer. This module does not attempt that design here; it
+# only makes the *failure* honest.
+#
+# Without this, `ClientSession.call_tool` (etc.) raises a bare `RuntimeError`
+# instructing the caller to "pass allow_input_required=True ... and retry
+# ...(..., input_responses=..., request_state=...)". That message reaches
+# the calling Amplifier agent verbatim via wrapper.py's generic exception
+# handler -- an LLM agent reading it has no way to act on it, because this
+# module exposes no `allow_input_required` / `input_responses` parameter
+# anywhere in its public surface. Telling a caller to do something the
+# module doesn't let it do is worse than a plain failure.
+
+
+def is_mrtr_unsupported_error(exc: BaseException) -> bool:
+    """True if ``exc`` is the SDK's built-in guard against an unanswered MRTR response.
+
+    On `mcp>=2.0`, `ClientSession.call_tool` / `get_prompt` / `read_resource`
+    raise a bare `RuntimeError` (no dedicated exception subclass -- see
+    `mcp.client.session._input_required_unexpected`) whenever the server
+    returns `InputRequiredResult` and the caller did not pass
+    `allow_input_required=True`. This module never passes that flag (MRTR
+    is not wired -- see docs/GAP_ANALYSIS.md §5.2), so any occurrence of
+    this error means a server tried to elicit input this client cannot
+    supply.
+
+    Detection is necessarily message-based: the installed SDK exposes no
+    dedicated exception type for this specific case (contrast with
+    `InputRequiredRoundsExceededError`, which covers a different MRTR
+    failure -- exceeding the retry-round cap of a driver this module
+    never invokes). `mcp<2.0` has no `InputRequiredResult` concept at all,
+    so this can only ever be True against `mcp>=2.0`.
+    """
+    return isinstance(exc, RuntimeError) and "InputRequiredResult" in str(exc)
+
+
+class MRTRNotSupportedError(RuntimeError):
+    """Raised in place of the SDK's un-actionable MRTR guard message.
+
+    The server requested multi-round-trip input (MRTR / `InputRequiredResult`)
+    to complete the call, and this module does not yet implement a way to
+    answer that request. Callers should treat this the same as any other
+    tool-execution failure -- there is no retry that will succeed.
+    """

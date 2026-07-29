@@ -26,10 +26,12 @@ from amplifier_module_tool_mcp.reconnection import (
 from amplifier_module_tool_mcp.sdk_compat import (
     MCP_ERROR_CLASS,
     MCPProtocolError,
+    MRTRNotSupportedError,
     build_client_info,
     describe_mcp_error,
     extract_root_cause,
     is_modern_protocol_version,
+    is_mrtr_unsupported_error,
     negotiate,
     supports_log_level_kwarg,
 )
@@ -359,6 +361,24 @@ class MCPStreamableHTTPClient:
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
+
+            if is_mrtr_unsupported_error(e):
+                # The SDK's own message here ("pass allow_input_required=True
+                # ... retry call_tool(..., input_responses=...)") is not
+                # actionable by this caller -- this module exposes no such
+                # parameters. Replace it with an honest statement of what
+                # actually happened rather than an instruction the caller
+                # cannot follow.
+                message = (
+                    f"MCP server '{self.server_name}' requires interactive "
+                    f"input (MRTR / InputRequiredResult) to complete tool "
+                    f"'{tool_name}'. This module does not yet support the "
+                    f"multi-round-trip input protocol -- the call cannot be "
+                    f"completed."
+                )
+                logger.error(message)
+                raise MRTRNotSupportedError(message) from e
+
             logger.error(
                 f"Tool call failed for '{tool_name}' on '{self.server_name}': {e}"
             )

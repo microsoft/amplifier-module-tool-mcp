@@ -19,7 +19,16 @@ both directions and should not be used for planning.
 | Installed SDK | Protocol negotiated | Handshake |
 |---|---|---|
 | `mcp>=2.0` | 2026-07-28 (stateless) | `server/discover`; no `initialize`, no `notifications/initialized`; full `_meta` on every request |
-| `mcp>=1.24,<2` | handshake-era (2025-11-25 observed on 1.29.0) | legacy `initialize()`; degradation logged once per process at INFO |
+| `mcp>=1.24,<2` | handshake-era (2025-11-25 observed on 1.29.0) | legacy `initialize()`; degradation logged once per process at WARNING |
+
+**This module is not fully conformant with 2026-07-28.** On `mcp>=2.0` it
+negotiates and speaks protocol 2026-07-28, and the request/transport layer is
+conformant: `server/discover` era detection, `_meta` on every request, the
+required HTTP headers, and cursor-following pagination. But at least one client
+**MUST** in the spec — `x-mcp-header` mirroring and the associated `tools/list`
+exclusion rule (§5.4) — is not implemented, and `resultType` is never read
+(§5.2). "Speaks 2026-07-28" is the accurate claim; "full conformance" is not,
+and any wording to that effect elsewhere is wrong.
 
 **Implemented and conforming:** protocol negotiation with automatic era fallback,
 cursor-following pagination, real `clientInfo` identity, `structured_content`
@@ -29,6 +38,10 @@ stdio and Streamable HTTP transports, Tools / Resources / Prompts.
 **Known gaps (not implemented):** `subscriptions/listen` and all server→client
 notification handling, MRTR / elicitation, cache hints (`ttlMs` / `cacheScope`),
 `x-mcp-header` mirroring, OAuth authorization.
+
+**Known operational limitation:** under Amplifier's default logging
+configuration, the negotiated protocol version is not visible to the user —
+see §5.6.
 
 **Deliberately excluded:** Roots, Sampling, HTTP+SSE transport — all deprecated in
 2026-07-28. These are correctly absent and should not be built.
@@ -131,7 +144,7 @@ Legend: **OK** = implemented and conforming · **GAP** = required or expected, a
 | 19 | `listChanged` observed | GAP | consequence of §5.1 |
 | 20 | `x-mcp-header` mirroring + invalid-tool exclusion (MUST) | GAP | see §5.4 |
 | 21 | `ttlMs` / `cacheScope` honoured | GAP | see §5.3 |
-| 22 | HTTP: `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers | OK | `MCP-Protocol-Version: 2026-07-28` on all 5 requests, matching body `_meta`; `Mcp-Method` exact on each (server/discover, tools/list, resources/list, prompts/list, tools/call); `Mcp-Name: add` present on tools/call only, correctly absent on list calls [executed, 6-request HTTP capture] — see §6 |
+| 22 | HTTP: `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers | OK | `MCP-Protocol-Version: 2026-07-28` on all 5 requests, matching body `_meta`; `Mcp-Method` exact on each (server/discover, tools/list, resources/list, prompts/list, tools/call); `Mcp-Name` present on named calls only, correctly absent on list calls — captured as `add` on `tools/call`, `verify://greeting` on `resources/read`, `greet` on `prompts/get` [executed, HTTP capture] — see §7 |
 | 23 | HTTP: `Accept` lists both content types | OK | `accept: application/json, text/event-stream` on every request [executed, 6-request HTTP capture] — see §6 |
 | 24 | Broken stream ⇒ re-issue with new request ID | partial | reconnection is full teardown + fresh negotiation, not per-request re-issue [inspection] |
 | 25 | OAuth / authorization | GAP | static config headers only; see §5.5 |
@@ -163,7 +176,17 @@ in `amplifier_module_tool_mcp/`. [inspection]
 `resultType` is never read by module code. On `mcp>=2.0` the SDK parses the field and
 exposes `run_input_required_driver` and an `elicitation_callback` hook, but nothing in
 this module supplies either. A server that returns `resultType: "input_required"` will
-therefore not be answered; what the caller sees in that case has not been tested.
+therefore not be answered.
+
+**What the caller now sees.** MRTR remains unimplemented; only the failure message
+changed. Previously the SDK's own guard raised a bare `RuntimeError` instructing the
+caller to retry with `allow_input_required=True` and `input_responses=` /
+`request_state=` — parameters this module exposes nowhere, so an agent that read the
+message and tried to comply structurally could not. That error is now intercepted
+(`sdk_compat.is_mrtr_unsupported_error` / `MRTRNotSupportedError`) and replaced with a
+message stating plainly that MRTR is unsupported and the call cannot complete. The
+call still fails; it now fails honestly rather than pointing the caller at an
+unreachable retry. Covered by `tests/test_mrtr.py`. [executed]
 
 This is not a small wiring job. It needs a design pass first: MRTR requires the client
 to answer a structured input request, and there is no established pattern for how an
@@ -206,24 +229,42 @@ MUSTs that the authorization spec carries (`iss` validation, issuer-keyed creden
 storage, `application_type` in Dynamic Client Registration). This is a separate
 workstream, not a defect in the protocol layer.
 
+### 5.6 Negotiated protocol version is invisible under default logging
+
+Amplifier installs no logging handler, so Python's `logging.lastResort` applies and
+only WARNING and above reaches the user. Every `logger.info` record this module emits
+is therefore silently dropped in a normal session — including the
+`"Connected to MCP server 'X' (protocol 2026-07-28) - discovered N tools, ..."` line
+(`client.py:235`), whose entire purpose is telling an operator which protocol era their
+connections are on.
+
+Two mitigations are in place, and neither closes the gap:
+
+- The legacy-degradation message was deliberately raised to WARNING
+  (`sdk_compat.py:167`) so the case that actually matters — silently running a
+  handshake-era protocol — *is* visible by default.
+- The negotiated version is available programmatically via the `protocol_version`
+  property on both clients (`client.py:137`, `streamable_http_client.py:112`).
+
+Stated plainly: under default configuration a user cannot see which protocol their
+connections negotiated unless it degraded. Observed in a Digital Twin Universe run
+(see §7). [executed]
+
 ---
 
 ## 6. What is not known (still-unverified items)
 
 Items 22–23 (HTTP headers: `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Accept`)
-were verified via real request capture against a Streamable HTTP server on `mcp==2.0.0`
-(see § 7). Three HTTP-layer requirements remain unverified due to lab constraints:
+were verified via real request capture against a Streamable HTTP server on `mcp==2.0.0`,
+including `Mcp-Name` on `resources/read` and `prompts/get` (see § 7). Two HTTP-layer
+requirements remain unverified:
 
-1. **`Mcp-Name` on `resources/read` and `prompts/get`** — `tools/call` was captured with
-   correct header; the mechanism is generic and method-name-driven, so it should fire
-   identically for resource and prompt read operations. [inspection]
-   
-2. **Non-ASCII header value encoding** — the `=?base64?...?=` sentinel encoding for
-   non-ASCII-valued tool names and arguments. Never exercised in capture; test used
+1. **Non-ASCII header value encoding** — the `=?base64?...?=` sentinel encoding for
+   non-ASCII-valued tool names and arguments. Never exercised in capture; tests used
    ASCII-only identifiers. The RFC 2047 encoder exists in the SDK source; mechanism is
-   unverified in practice.
-   
-3. **`x-mcp-header` mirroring** — `Mcp-Param-*` headers for annotated tool parameters.
+   unverified in practice. [inspection]
+
+2. **`x-mcp-header` mirroring** — `Mcp-Param-*` headers for annotated tool parameters.
    This is a client MUST (spec § 4.3.4) and remains unimplemented. See § 5.4.
 
 ---
@@ -257,7 +298,7 @@ The following were run, not inferred:
    |---|---|
    | `MCP-Protocol-Version: 2026-07-28` on all POST requests | **SATISFIED** — matched body `_meta.protocolVersion` in every case |
    | `Mcp-Method` (spec method name) on all requests | **SATISFIED** — exact method: `server/discover`, `tools/list`, `resources/list`, `prompts/list`, `tools/call` |
-   | `Mcp-Name` on tool/resource/prompt calls | **SATISFIED** — `mcp-name: add` on `tools/call` only; correctly absent on list calls |
+   | `Mcp-Name` on tool/resource/prompt calls | **SATISFIED** — `mcp-name: add` on `tools/call` only; correctly absent on list calls. A later capture against a live Streamable HTTP server extended this to the other two named methods: `resources/read` → `Mcp-Name=verify://greeting`, `prompts/get` → `Mcp-Name=greet` |
    | `Accept: application/json, text/event-stream` | **SATISFIED** — on every request |
    | No `Mcp-Session-Id` header | **SATISFIED** — absent from all client requests |
    | No GET requests, no `Last-Event-ID` | **SATISFIED** — all requests were POST; no GET, no `Last-Event-ID` |
@@ -274,7 +315,38 @@ The following were run, not inferred:
    discovered — including the empty-string cursor, which the spec says MUST NOT be
    treated as end-of-results.
 
-5. **Test suite.** 80 tests, passing on both `mcp==1.29.0` and `mcp==2.0.0`.
+5. **Two silent-failure defects found in review of the above, fixed, and
+   independently re-verified live.** Both were in the newly-added pagination /
+   discovery code and both produced a partial-or-empty list with no signal:
+
+   - `pagination.py` read the cursor with `default=None`, so a page object carrying
+     neither `next_cursor` nor `nextCursor` was treated as terminal and a partial
+     list was returned silently — reinstating the exact bug the module exists to fix,
+     and making the repeated-cursor and max-pages guards unreachable. The `default=`
+     is removed; an unrecognized page shape now raises `AttributeError` naming both
+     candidate field names.
+   - `discovery.py` wrapped resources/prompts discovery in a bare
+     `except Exception`, which swallowed `collect_paginated`'s deliberate
+     `RuntimeError` safety nets: a server returning a repeated cursor forever
+     produced `[]` with zero signal at WARNING level. Narrowed to `MCP_ERROR_CLASS`
+     plus an explicit JSON-RPC `-32601` (method-not-found) check; anything else
+     propagates.
+
+   Re-verified live after the fix: a repeated-cursor server now raises for tools,
+   resources, **and** prompts, while a genuine method-not-found still yields `[]`
+   quietly.
+
+6. **Mounted as a real Amplifier tool module in a Digital Twin Universe.** Every
+   other item above drove this module's Python classes directly; this one did not.
+   The module was mounted through normal bundle + `mcp.json` configuration with no
+   Python classes touched, its tools appeared in the live session tool list as
+   `mcp_dtutest_*`, and an agent called one end-to-end and received the correct
+   value back — negotiating protocol 2026-07-28 against `mcp` SDK 2.0.0. This closes
+   the gap between "the classes work in isolation" and "the module works as an
+   Amplifier module". The same run surfaced the log-visibility limitation in §5.6.
+
+7. **Test suite.** 99 tests, passing on both `mcp==1.29.0` and `mcp==2.0.0`, zero
+   skips (was 80). New files: `tests/test_discovery.py`, `tests/test_mrtr.py`.
 
 Everything else in this document is drawn from reading the source and is labelled
 `[inspection]`.

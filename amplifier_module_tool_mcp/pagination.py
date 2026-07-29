@@ -76,7 +76,15 @@ async def collect_paginated(
         result = await fetch_page(cursor)
         items.extend(getattr(result, items_attr))
 
-        next_cursor = sdk_field(result, "next_cursor", "nextCursor", default=None)
+        # No `default=` here: `next_cursor`/`nextCursor` is a required-but-
+        # nullable field on every SDK-major's page result, not a genuinely
+        # optional one (see sdk_field's own docstring on that distinction).
+        # If neither name exists on `result`, that's an unrecognized SDK
+        # shape and must raise (AttributeError, from sdk_field) rather than
+        # silently treating the page as terminal -- the latter would resume
+        # exactly the silent-truncation bug this module exists to fix, and
+        # would make the repeated-cursor/max-pages guards below unreachable.
+        next_cursor = sdk_field(result, "next_cursor", "nextCursor")
         if next_cursor is None:
             return items
 
