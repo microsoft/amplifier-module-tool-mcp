@@ -9,7 +9,14 @@ authors = [
     { name = "Brian Krabach" },
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # Floor of 1.24: below this version the `streamable_http_client` symbol
+    # does not exist under that name in `mcp.client.streamable_http` (it was
+    # named `streamablehttp_client`). Verified empirically -- 1.23.0 and every
+    # earlier release fail at import; 1.24.0 is the first that works.
+    # Upper bound intentionally left open -- 2.x's field renames
+    # (camelCase -> snake_case) are handled via
+    # amplifier_module_tool_mcp.sdk_compat, so both 1.x and 2.x are supported.
+    "mcp>=1.24",
     "pydantic>=2.0",
 ]
 

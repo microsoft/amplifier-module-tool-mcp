@@ -1,4 +1,9 @@
-"""Streamable HTTP transport MCP client (2025-03-26 spec)."""
+"""Streamable HTTP transport MCP client.
+
+Protocol version handling (which MCP spec revision is negotiated during
+the handshake) is delegated entirely to the underlying `mcp` SDK; this
+module does not pin or assume a specific spec version.
+"""
 
 import asyncio
 import logging
@@ -8,9 +13,12 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
-from amplifier_module_tool_mcp.reconnection import CircuitBreaker
-from amplifier_module_tool_mcp.reconnection import ReconnectionConfig
-from amplifier_module_tool_mcp.reconnection import ReconnectionStrategy
+from amplifier_module_tool_mcp.reconnection import (
+    CircuitBreaker,
+    ReconnectionConfig,
+    ReconnectionStrategy,
+)
+from amplifier_module_tool_mcp.sdk_compat import extract_root_cause, sdk_field
 
 logger = logging.getLogger(__name__)
 
@@ -20,29 +28,14 @@ logger = logging.getLogger(__name__)
 CONNECTION_TIMEOUT = 30.0
 
 
-def _extract_root_cause(exc: BaseException) -> BaseException:
-    """Unwrap ExceptionGroup to the most informative root cause.
-
-    The MCP SDK's anyio TaskGroup surfaces transport errors as
-    ExceptionGroup("unhandled errors in a TaskGroup", [actual_error]).
-    Unwrapping gives callers the real cause (e.g. HTTPStatusError 502)
-    instead of the opaque ExceptionGroup string.
-
-    Available natively from Python 3.11; anyio produces ExceptionGroup
-    on earlier versions too via the exceptiongroup backport.
-    """
-    if isinstance(exc, ExceptionGroup) and exc.exceptions:
-        return _extract_root_cause(exc.exceptions[0])
-    return exc
-
-
 class MCPStreamableHTTPClient:
     """
-    MCP client using Streamable HTTP transport (2025-03-26 spec).
+    MCP client using Streamable HTTP transport.
 
-    This is the newer HTTP transport that replaces HTTP+SSE in the
-    latest MCP specification. It uses a single endpoint for both
-    POST and GET requests with optional SSE streaming.
+    This is the HTTP transport that replaces HTTP+SSE in newer MCP
+    specifications. It uses a single endpoint for both POST and GET
+    requests with optional SSE streaming. Protocol version negotiation
+    is handled entirely by the underlying `mcp` SDK.
     """
 
     def __init__(
@@ -118,7 +111,7 @@ class MCPStreamableHTTPClient:
           this, a cancellation would bypass the ``_ready_event.set()`` call
           and leave ``connect()`` blocked forever.
 
-        * Calls ``_extract_root_cause()`` on the caught exception to unwrap
+        * Calls ``extract_root_cause()`` on the caught exception to unwrap
           ``ExceptionGroup`` values produced by anyio's TaskGroup.  This
           surfaces the real failure (e.g. "HTTP 502 Bad Gateway") instead of
           the opaque "unhandled errors in a TaskGroup (1 sub-exception)"
@@ -177,7 +170,7 @@ class MCPStreamableHTTPClient:
 
         except BaseException as e:
             # Unwrap anyio ExceptionGroup → real transport error for readable logs.
-            root_cause = _extract_root_cause(e)
+            root_cause = extract_root_cause(e)
 
             self._connection_error = root_cause
             self._connected = False
@@ -275,7 +268,7 @@ class MCPStreamableHTTPClient:
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "input_schema": tool.inputSchema,
+                "input_schema": sdk_field(tool, "input_schema", "inputSchema"),
             }
             for tool in tools_result.tools
         ]
@@ -288,9 +281,7 @@ class MCPStreamableHTTPClient:
                     "uri": str(resource.uri),
                     "name": resource.name,
                     "description": resource.description or "",
-                    "mime_type": resource.mimeType
-                    if hasattr(resource, "mimeType")
-                    else None,
+                    "mime_type": sdk_field(resource, "mime_type", "mimeType"),
                 }
                 for resource in resources_result.resources
             ]
