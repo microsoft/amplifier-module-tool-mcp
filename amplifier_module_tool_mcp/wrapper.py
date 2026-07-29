@@ -11,6 +11,7 @@ from amplifier_module_tool_mcp.content_utils import (
     extract_text_from_mcp_content,
     truncate_content_if_needed,
 )
+from amplifier_module_tool_mcp.sdk_compat import MCPProtocolError, sdk_field
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ class MCPToolWrapper:
             # Extract content from result with size protection
             content, was_truncated = self._extract_content(result)
 
+            # structuredContent (1.x) / structured_content (2.x) is genuinely
+            # optional -- a server may simply not return it -- so this reads
+            # with a default rather than the fail-loud (no-default) form used
+            # for fields that are merely renamed, not optional.
+            structured_content = sdk_field(
+                result, "structured_content", "structuredContent", default=None
+            )
+
             # ToolResult.output must be a dict, not a string
             # Include MCP metadata for better log viewer experience
             return ToolResult(
@@ -102,6 +111,28 @@ class MCPToolWrapper:
                     "mcp_tool": self.tool_name,
                     "content_size_chars": len(content),
                     "content_truncated": was_truncated,
+                    "structured_content": structured_content,
+                },
+            )
+
+        except MCPProtocolError as e:
+            # A well-formed JSON-RPC protocol error from the server (real
+            # error code), as opposed to a transport failure. Surface the
+            # code/data/explanation so a caller can distinguish the two.
+            logger.error(
+                f"MCP tool '{self.name}' failed with protocol error {e.code}: {e.explanation}"
+            )
+            error_msg = str(e)
+            return ToolResult(
+                success=False,
+                output=error_msg,
+                error={
+                    "message": error_msg,
+                    "mcp_server": self.server_name,
+                    "mcp_tool": self.tool_name,
+                    "mcp_error_code": e.code,
+                    "mcp_error_data": e.data,
+                    "mcp_error_explanation": e.explanation,
                 },
             )
 

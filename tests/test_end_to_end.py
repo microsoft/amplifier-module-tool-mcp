@@ -127,6 +127,15 @@ async def test_real_server_connect_discover_call_disconnect(tmp_path: Path) -> N
         await client.connect()
         assert client.is_connected
 
+        # The protocol version must actually be negotiated (via
+        # `negotiate_auto`'s `server/discover` probe on mcp>=2.0, or the
+        # legacy `initialize()` fallback on mcp<2.0) -- not left as an
+        # unset/guessed default. This is the concrete, real-server proof
+        # that connect() drives a real handshake either way.
+        assert client.protocol_version, (
+            f"protocol_version was not negotiated: {client.protocol_version!r}"
+        )
+
         tools = client.get_tools()
         assert len(tools) == 1, f"Expected exactly one tool, got: {tools}"
 

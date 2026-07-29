@@ -9,12 +9,26 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from amplifier_module_tool_mcp.discovery import (
+    discover_prompts,
+    discover_resources,
+    discover_tools,
+)
 from amplifier_module_tool_mcp.reconnection import (
     CircuitBreaker,
     ReconnectionConfig,
     ReconnectionStrategy,
 )
-from amplifier_module_tool_mcp.sdk_compat import extract_root_cause, sdk_field
+from amplifier_module_tool_mcp.sdk_compat import (
+    MCP_ERROR_CLASS,
+    MCPProtocolError,
+    build_client_info,
+    describe_mcp_error,
+    extract_root_cause,
+    is_modern_protocol_version,
+    negotiate,
+    supports_log_level_kwarg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +91,17 @@ class MCPClient:
         self.prompts: list[dict[str, Any]] = []
         self._state = ConnectionState.DISCONNECTED
 
+        # Negotiated protocol version (e.g. "2026-07-28", or a legacy
+        # handshake version like "2025-03-26"). None until connect() has
+        # run at least once. See `protocol_version` property.
+        self._protocol_version: str | None = None
+
+        # Desired log level, cached for the *next* ClientSession
+        # construction. `logging/setLevel` was removed in 2026-07-28; on a
+        # modern-negotiated session, log level can only be set at
+        # ClientSession construction time (see `set_logging_level`).
+        self._log_level: str | None = None
+
         # Background task for connection lifecycle
         self._connection_task: asyncio.Task | None = None
         self._ready_event = asyncio.Event()
@@ -105,6 +130,11 @@ class MCPClient:
     def is_connected(self) -> bool:
         """Check if client is connected."""
         return self._state == ConnectionState.CONNECTED
+
+    @property
+    def protocol_version(self) -> str | None:
+        """Negotiated MCP protocol version (e.g. "2026-07-28"), or None before connect()."""
+        return self._protocol_version
 
     @property
     def health_status(self) -> dict[str, Any]:
@@ -169,10 +199,28 @@ class MCPClient:
                     read,
                     write,
                 ):
+                    # Build ClientSession kwargs. `client_info` identifies
+                    # this module (rather than the SDK's own "mcp/0.1.0"
+                    # placeholder) to the server on both SDK majors.
+                    # `log_level` is only accepted by mcp>=2.0 -- pass it
+                    # only when supported and a level has been requested via
+                    # a prior set_logging_level() call.
+                    session_kwargs: dict[str, Any] = {
+                        "client_info": build_client_info()
+                    }
+                    if self._log_level is not None and supports_log_level_kwarg():
+                        session_kwargs["log_level"] = self._log_level
+
                     # Enter ClientSession context - stays in THIS task
-                    async with ClientSession(read, write) as session:
-                        # Initialize
-                        await session.initialize()
+                    async with ClientSession(read, write, **session_kwargs) as session:
+                        # Negotiate protocol version. On mcp>=2.0 this drives
+                        # the full modern stateless handshake (server/discover
+                        # + automatic legacy fallback); on mcp<2.0 (no
+                        # negotiate_auto) it falls back to the legacy
+                        # initialize() and logs that degradation once.
+                        self._protocol_version = await negotiate(
+                            session, server_name=self.server_name
+                        )
 
                         # Store session and signal ready
                         self.session = session
@@ -183,7 +231,8 @@ class MCPClient:
                         self._ready_event.set()
 
                         logger.info(
-                            f"Connected to MCP server '{self.server_name}' - "
+                            f"Connected to MCP server '{self.server_name}' "
+                            f"(protocol {self._protocol_version or 'unknown'}) - "
                             f"discovered {len(self.tools)} tools, {len(self.resources)} resources, "
                             f"{len(self.prompts)} prompts"
                         )
@@ -315,6 +364,26 @@ class MCPClient:
             self._circuit_breaker.record_success()
             return result
 
+        except MCP_ERROR_CLASS as e:
+            # A well-formed JSON-RPC protocol error -- the server understood
+            # the request and rejected it with a real error code. Preserve
+            # code/message/data/explanation via MCPProtocolError so callers
+            # (wrapper.py) can distinguish this from a transport failure.
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Tool call failed for '{tool_name}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Tool execution failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
+
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
@@ -345,58 +414,23 @@ class MCPClient:
         )
 
     async def _discover_capabilities(self) -> None:
-        """Discover tools, resources, and prompts from server."""
+        """Discover tools, resources, and prompts from server.
+
+        Delegates to `amplifier_module_tool_mcp.discovery`, which follows
+        pagination cursors to completion (a server returning `nextCursor`
+        is no longer silently truncated) and is shared verbatim with
+        `MCPStreamableHTTPClient` so both transports stay in lockstep.
+        """
         if not self.session:
             return
 
-        # Discover tools
-        tools_result = await self.session.list_tools()
-        self.tools = [
-            {
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": sdk_field(tool, "input_schema", "inputSchema"),
-            }
-            for tool in tools_result.tools
-        ]
-
-        # Discover resources
-        try:
-            resources_result = await self.session.list_resources()
-            self.resources = [
-                {
-                    "uri": str(resource.uri),
-                    "name": resource.name,
-                    "description": resource.description or "",
-                    "mime_type": sdk_field(resource, "mime_type", "mimeType"),
-                }
-                for resource in resources_result.resources
-            ]
-        except Exception as e:
-            logger.debug(f"Server '{self.server_name}' does not support resources: {e}")
-            self.resources = []
-
-        # Discover prompts
-        try:
-            prompts_result = await self.session.list_prompts()
-            self.prompts = [
-                {
-                    "name": prompt.name,
-                    "description": prompt.description or "",
-                    "arguments": [
-                        {
-                            "name": arg.name,
-                            "description": arg.description or "",
-                            "required": arg.required,
-                        }
-                        for arg in (prompt.arguments or [])
-                    ],
-                }
-                for prompt in prompts_result.prompts
-            ]
-        except Exception as e:
-            logger.debug(f"Server '{self.server_name}' does not support prompts: {e}")
-            self.prompts = []
+        self.tools = await discover_tools(self.session)
+        self.resources = await discover_resources(
+            self.session, server_name=self.server_name
+        )
+        self.prompts = await discover_prompts(
+            self.session, server_name=self.server_name
+        )
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
@@ -407,6 +441,22 @@ class MCPClient:
             result = await self.session.read_resource(uri=uri)
             self._circuit_breaker.record_success()
             return result
+
+        except MCP_ERROR_CLASS as e:
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Resource read failed for '{uri}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Resource read failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
 
         except Exception as e:
             self._circuit_breaker.record_failure()
@@ -428,6 +478,22 @@ class MCPClient:
             self._circuit_breaker.record_success()
             return result
 
+        except MCP_ERROR_CLASS as e:
+            self._circuit_breaker.record_failure()
+            self._last_error = e
+            info = describe_mcp_error(e)
+            logger.error(
+                f"Get prompt failed for '{name}' on '{self.server_name}': "
+                f"MCP error {info['code']} -- {info['explanation']}"
+            )
+            raise MCPProtocolError(
+                f"Get prompt failed: {info['message']}",
+                code=info["code"],
+                message=info["message"],
+                data=info["data"],
+                explanation=info["explanation"],
+            ) from e
+
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
@@ -435,7 +501,34 @@ class MCPClient:
             raise RuntimeError(f"Get prompt failed: {e}") from e
 
     async def set_logging_level(self, level: str) -> None:
-        """Set the logging level for the MCP server."""
+        """Set the logging level for the MCP server.
+
+        `logging/setLevel` was removed from the protocol in 2026-07-28; log
+        level is now negotiated once per session (via `_meta` on every
+        request, driven by `ClientSession(log_level=...)`), not set via a
+        standalone RPC.
+
+        On a legacy-negotiated session, the old RPC is still correct and is
+        sent as before. On a modern-negotiated session, the requested level
+        is cached for the *next* connection (passed to `ClientSession` at
+        construction) and this raises rather than silently no-op-ing or
+        sending a method the server has every right to reject.
+        """
+        if is_modern_protocol_version(self._protocol_version):
+            self._log_level = level
+            logger.info(
+                f"Cached log level '{level}' for server '{self.server_name}' -- "
+                f"will apply on the next connection via ClientSession(log_level=...)."
+            )
+            raise RuntimeError(
+                f"Cannot change logging level on an active modern-protocol "
+                f"({self._protocol_version}) session for '{self.server_name}': "
+                f"'logging/setLevel' was removed in 2026-07-28. The requested "
+                f"level {level!r} has been cached and will take effect on the "
+                f"next reconnect. To apply it now, call disconnect() then "
+                f"connect() again."
+            )
+
         if not self.is_connected or not self.session:
             await self.connect()
 
