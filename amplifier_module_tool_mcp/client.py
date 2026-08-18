@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import shutil
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,28 @@ from amplifier_module_tool_mcp.sdk_compat import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_command(command: str, env: dict[str, str]) -> str:
+    """Resolve an MCP stdio server command to a launchable path.
+
+    MCP servers are typically configured with a bare command name like ``npx``
+    or ``uvx``. On Windows these exist only as ``.cmd``/``.bat`` shims (e.g.
+    ``npx.cmd``), and the stdio transport spawns the child WITHOUT a shell, so
+    ``CreateProcess`` never applies ``PATHEXT`` -- a bare ``"npx"`` fails with
+    ``FileNotFoundError``/``WinError 2``. Resolving via ``shutil.which`` (which
+    honours ``PATHEXT`` on Windows) using the child's own ``PATH`` yields the
+    real ``npx.cmd`` path. Falls back to the original command unchanged when
+    resolution fails or the command already contains a path separator, so
+    behaviour is never worse than before (and is a no-op on POSIX, where the
+    resolved absolute path is equivalent to the bare name).
+    """
+    if not command:
+        return command
+    if os.sep in command or (os.altsep and os.altsep in command):
+        return command
+    resolved = shutil.which(command, path=env.get("PATH"))
+    return resolved or command
 
 
 class ConnectionState(Enum):
@@ -176,7 +200,7 @@ class MCPClient:
                 merged_env = os.environ.copy()
 
             server_params = StdioServerParameters(
-                command=self.command,
+                command=_resolve_command(self.command, merged_env),
                 args=self.args,
                 env=merged_env,
             )
