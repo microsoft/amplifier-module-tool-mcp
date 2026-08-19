@@ -117,3 +117,46 @@ def test_empty_config(monkeypatch, tmp_path):
     # Should return dict (may be empty or may have user-level config)
     # The important thing is it doesn't crash with no config
     assert isinstance(servers, dict)
+
+
+def test_load_config_with_utf8_bom(tmp_path, sample_mcp_config, monkeypatch):
+    """A BOM-prefixed mcp.json still loads.
+
+    Windows editors (Notepad's default "UTF-8" save, PowerShell redirection)
+    prefix the file with a UTF-8 BOM. Read as plain utf-8, the leading U+FEFF
+    makes json.load raise, and the broad except in _load_json_file swallows it
+    and returns None -- silently dropping every configured server.
+    """
+    config_file = tmp_path / "mcp.json"
+    # encoding="utf-8-sig" on write emits the BOM, reproducing what a Windows
+    # editor produces.
+    with open(config_file, "w", encoding="utf-8-sig") as f:
+        json.dump(sample_mcp_config, f)
+
+    # Confirm the fixture actually has a BOM -- otherwise this test proves nothing.
+    assert config_file.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    monkeypatch.setenv("AMPLIFIER_MCP_CONFIG", str(config_file))
+
+    config = MCPConfig()
+    servers = config.load_servers()
+
+    assert "test-server" in servers
+    assert servers["test-server"]["command"] == "npx"
+
+
+def test_load_config_without_bom_unaffected(tmp_path, sample_mcp_config, monkeypatch):
+    """Reading as utf-8-sig is a no-op for BOM-less files."""
+    config_file = tmp_path / "mcp.json"
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(sample_mcp_config, f)
+
+    assert not config_file.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    monkeypatch.setenv("AMPLIFIER_MCP_CONFIG", str(config_file))
+
+    config = MCPConfig()
+    servers = config.load_servers()
+
+    assert "test-server" in servers
+    assert servers["test-server"]["command"] == "npx"

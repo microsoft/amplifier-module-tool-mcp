@@ -96,7 +96,12 @@ class MCPConfig:
             return None
 
         try:
-            with open(path, encoding="utf-8") as f:
+            # encoding="utf-8-sig": a Windows-authored mcp.json (Notepad's
+            # default "UTF-8" save) carries a BOM; read as plain utf-8 the
+            # leading U+FEFF makes json.load raise, and the broad except below
+            # silently drops ALL configured servers. utf-8-sig strips a leading
+            # BOM if present and is identical to utf-8 otherwise.
+            with open(path, encoding="utf-8-sig") as f:
                 config = json.load(f)
             logger.debug(f"Loaded MCP config from {source}: {path}")
             return config
