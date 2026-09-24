@@ -22,7 +22,7 @@ def test_load_from_inline():
 
 
 def test_load_from_project_config(temp_config_dir, sample_mcp_config, monkeypatch):
-    """Test loading configuration from project .amplifier/mcp.json."""
+    """Project-local stdio commands are not loaded."""
     # Change to temp directory
     monkeypatch.chdir(temp_config_dir.parent)
 
@@ -34,8 +34,48 @@ def test_load_from_project_config(temp_config_dir, sample_mcp_config, monkeypatc
     config = MCPConfig()
     servers = config.load_servers()
 
-    assert "test-server" in servers
-    assert servers["test-server"]["command"] == "npx"
+    assert "test-server" not in servers
+
+
+def test_load_http_server_from_project_config(temp_config_dir, monkeypatch):
+    """Project-local HTTP servers remain safe to discover."""
+    monkeypatch.chdir(temp_config_dir.parent)
+    project_config = {
+        "mcpServers": {
+            "test-server": {
+                "type": "streamable-http",
+                "url": "https://example.test/mcp",
+            }
+        }
+    }
+    with open(temp_config_dir / "mcp.json", "w") as f:
+        json.dump(project_config, f)
+
+    servers = MCPConfig().load_servers()
+
+    assert servers["test-server"]["url"] == "https://example.test/mcp"
+    assert servers["test-server"].source == "project"
+
+
+def test_project_config_cannot_self_approve_stdio(temp_config_dir, monkeypatch):
+    """Trust-like fields in project config cannot authorize execution."""
+    monkeypatch.chdir(temp_config_dir.parent)
+    project_config = {
+        "mcpServers": {
+            "test-server": {
+                "command": "npx",
+                "args": ["-y", "test-server"],
+                "trusted": True,
+                "approved": True,
+            }
+        }
+    }
+    with open(temp_config_dir / "mcp.json", "w") as f:
+        json.dump(project_config, f)
+
+    servers = MCPConfig().load_servers()
+
+    assert "test-server" not in servers
 
 
 def test_load_from_env(tmp_path, sample_mcp_config, monkeypatch):
@@ -52,6 +92,7 @@ def test_load_from_env(tmp_path, sample_mcp_config, monkeypatch):
     servers = config.load_servers()
 
     assert "test-server" in servers
+    assert servers["test-server"].source == "environment"
 
 
 def test_config_priority(temp_config_dir, monkeypatch):
@@ -80,6 +121,34 @@ def test_config_priority(temp_config_dir, monkeypatch):
 
     # Inline should override project
     assert servers["test-server"]["command"] == "inline-command"
+    assert servers["test-server"].source == "inline"
+
+
+def test_blocked_project_stdio_does_not_shadow_user_config(
+    temp_config_dir, monkeypatch, tmp_path
+):
+    """A blocked project entry cannot replace a trusted user server."""
+    monkeypatch.chdir(temp_config_dir.parent)
+    user_home = tmp_path / "home"
+    user_config_dir = user_home / ".amplifier"
+    user_config_dir.mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: user_home)
+
+    with open(user_config_dir / "mcp.json", "w") as f:
+        json.dump(
+            {"mcpServers": {"test-server": {"command": "trusted-command", "args": []}}},
+            f,
+        )
+    with open(temp_config_dir / "mcp.json", "w") as f:
+        json.dump(
+            {"mcpServers": {"test-server": {"command": "project-command", "args": []}}},
+            f,
+        )
+
+    servers = MCPConfig().load_servers()
+
+    assert servers["test-server"]["command"] == "trusted-command"
+    assert servers["test-server"].source == "user"
 
 
 def test_env_var_substitution():

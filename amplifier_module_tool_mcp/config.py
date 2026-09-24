@@ -9,6 +9,14 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class MCPServerConfig(dict[str, Any]):
+    """Server configuration with trusted loader provenance."""
+
+    def __init__(self, config: dict[str, Any], source: str):
+        super().__init__(config)
+        self.source = source
+
+
 class MCPConfig:
     """
     Handles loading and resolution of MCP server configuration.
@@ -32,28 +40,62 @@ class MCPConfig:
         """
         self.inline_config = inline_config or {}
 
-    def load_servers(self) -> dict[str, dict[str, Any]]:
+    def load_servers(self) -> dict[str, MCPServerConfig]:
         """
         Load MCP server configurations from all sources.
 
         Returns:
             Dictionary mapping server names to their configurations
         """
-        servers = {}
+        servers: dict[str, MCPServerConfig] = {}
 
         # Load from each source (reverse priority order, so higher priority overwrites)
         # Priority: inline > env > project > user (matches foundation conventions)
-        for config in [
-            self._load_from_user_config(),
-            self._load_from_project_config(),
-            self._load_from_env(),
-            self._load_from_inline(),
+        for source, config in [
+            ("user", self._load_from_user_config()),
+            ("project", self._load_from_project_config()),
+            ("environment", self._load_from_env()),
+            ("inline", self._load_from_inline()),
         ]:
             if config and "mcpServers" in config:
-                servers.update(config["mcpServers"])
+                for server_name, server_config in config["mcpServers"].items():
+                    if not isinstance(server_config, dict):
+                        logger.warning(
+                            "Ignoring MCP server '%s' from %s config: "
+                            "configuration must be an object",
+                            server_name,
+                            source,
+                        )
+                        continue
+
+                    if source == "project" and self._uses_stdio(server_config):
+                        logger.warning(
+                            "Ignoring stdio MCP server '%s' from project config. "
+                            "Project-local commands are not executed automatically; "
+                            "move this server to inline, environment, or user config.",
+                            server_name,
+                        )
+                        continue
+
+                    servers[server_name] = MCPServerConfig(server_config, source)
 
         logger.info(f"Loaded {len(servers)} MCP server configurations")
         return servers
+
+    @staticmethod
+    def _uses_stdio(server_config: dict[str, Any]) -> bool:
+        """Return whether a server configuration selects process-based stdio."""
+        transport = server_config.get("type")
+        if isinstance(transport, str):
+            normalized_transport = transport.lower().replace("_", "-")
+            if normalized_transport in ("streamable-http", "streamablehttp", "http"):
+                return False
+            return normalized_transport == "stdio" or "command" in server_config
+
+        if "url" in server_config:
+            return False
+
+        return "command" in server_config
 
     def _load_from_inline(self) -> dict[str, Any] | None:
         """Load configuration from inline config (profile)."""

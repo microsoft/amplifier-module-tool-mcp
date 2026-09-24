@@ -113,7 +113,7 @@ includes:
 - ✅ MCP tool module configured with production defaults
 - ✅ Content size protection enabled (50k char limit)
 - ✅ Clean console output (server logs saved to files)
-- ✅ Automatic server discovery from `.amplifier/mcp.json`
+- ✅ Automatic HTTP server discovery from `.amplifier/mcp.json`
 - ✅ Clean dependency chain (no redundant includes)
 
 **Why this pattern?**
@@ -170,7 +170,10 @@ includes:
 
 ### 2. Configure MCP Servers
 
-Create `.amplifier/mcp.json`:
+Define stdio servers in trusted inline bundle configuration or
+`~/.amplifier/mcp.json`. Project-local `.amplifier/mcp.json` files may define
+HTTP servers, but stdio commands are ignored because repositories are not a
+trusted process-execution boundary.
 
 ```json
 {
@@ -251,7 +254,7 @@ tools:
 | `verbose_servers` | `false` | Show MCP server stderr output in console |
 | `server_log_dir` | `~/.amplifier/logs/mcp-servers/` | Directory for server logs when suppressed |
 | `max_content_size` | `50000` | Maximum content size in characters. Content exceeding this limit is automatically truncated with a notice to prevent context window exhaustion |
-| `servers` | (optional) | Inline server configuration (overrides .amplifier/mcp.json) |
+| `servers` | (optional) | Trusted inline server configuration (overrides external configuration) |
 
 **Environment variable override**:
 ```bash
@@ -274,9 +277,12 @@ AMPLIFIER_MCP_VERBOSE=true amplifier run "test"
 ### Configuration Priority
 
 1. **Inline config** (servers in bundle config) - highest priority
-2. **Project config** (`.amplifier/mcp.json`) - recommended
-3. **User config** (`~/.amplifier/mcp.json`) - fallback
-4. **Environment variable** (`AMPLIFIER_MCP_CONFIG`) - override
+2. **Environment variable** (`AMPLIFIER_MCP_CONFIG`) - explicit config path
+3. **Project config** (`.amplifier/mcp.json`) - HTTP servers only
+4. **User config** (`~/.amplifier/mcp.json`) - personal defaults
+
+Project-local stdio definitions are deliberately ignored. Put commands in
+inline, environment-selected, or user configuration only after reviewing them.
 
 ## Usage
 
@@ -312,7 +318,7 @@ Use postgres tools for database operations.
 Use puppeteer tools for web scraping and automation.
 ```
 
-With `.amplifier/mcp.json`:
+With trusted inline or user configuration:
 ```json
 {
   "mcpServers": {

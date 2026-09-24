@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from amplifier_module_tool_mcp.client import MCPClient
-from amplifier_module_tool_mcp.config import MCPConfig
+from amplifier_module_tool_mcp.config import MCPConfig, MCPServerConfig
 from amplifier_module_tool_mcp.content_utils import DEFAULT_MAX_CONTENT_SIZE
 from amplifier_module_tool_mcp.prompt_wrapper import MCPPromptWrapper
 from amplifier_module_tool_mcp.resource_wrapper import MCPResourceWrapper
@@ -153,6 +153,17 @@ class MCPManager:
         self, server_name: str, server_config: dict[str, Any]
     ) -> None:
         """Start a stdio-based MCP server."""
+        if (
+            isinstance(server_config, MCPServerConfig)
+            and server_config.source == "project"
+        ):
+            logger.error(
+                "Refusing to execute stdio MCP server '%s' from project config. "
+                "Move the server definition to inline, environment, or user config.",
+                server_name,
+            )
+            return
+
         command = server_config.get("command")
         args = server_config.get("args", [])
         env = server_config.get("env", {})
