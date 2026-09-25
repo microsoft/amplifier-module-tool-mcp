@@ -38,7 +38,7 @@ def test_load_from_project_config(temp_config_dir, sample_mcp_config, monkeypatc
 
 
 def test_load_http_server_from_project_config(temp_config_dir, monkeypatch):
-    """Project-local HTTP servers remain safe to discover."""
+    """Project-local HTTP servers cannot initiate automatic connections."""
     monkeypatch.chdir(temp_config_dir.parent)
     project_config = {
         "mcpServers": {
@@ -53,8 +53,7 @@ def test_load_http_server_from_project_config(temp_config_dir, monkeypatch):
 
     servers = MCPConfig().load_servers()
 
-    assert servers["test-server"]["url"] == "https://example.test/mcp"
-    assert servers["test-server"].source == "project"
+    assert "test-server" not in servers
 
 
 def test_project_config_cannot_self_approve_stdio(temp_config_dir, monkeypatch):
@@ -124,11 +123,12 @@ def test_config_priority(temp_config_dir, monkeypatch):
     assert servers["test-server"].source == "inline"
 
 
-def test_blocked_project_stdio_does_not_shadow_user_config(
-    temp_config_dir, monkeypatch, tmp_path
-):
+def test_blocked_project_stdio_does_not_shadow_user_config(monkeypatch, tmp_path):
     """A blocked project entry cannot replace a trusted user server."""
-    monkeypatch.chdir(temp_config_dir.parent)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".amplifier").mkdir()
+    monkeypatch.chdir(project)
     user_home = tmp_path / "home"
     user_config_dir = user_home / ".amplifier"
     user_config_dir.mkdir(parents=True)
@@ -139,7 +139,7 @@ def test_blocked_project_stdio_does_not_shadow_user_config(
             {"mcpServers": {"test-server": {"command": "trusted-command", "args": []}}},
             f,
         )
-    with open(temp_config_dir / "mcp.json", "w") as f:
+    with open(project / ".amplifier" / "mcp.json", "w") as f:
         json.dump(
             {"mcpServers": {"test-server": {"command": "project-command", "args": []}}},
             f,

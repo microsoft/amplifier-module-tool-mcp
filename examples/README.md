@@ -48,10 +48,13 @@ The example bundle uses inline configuration (servers defined directly in the bu
 
 The MCP module looks for server configuration in this order (highest priority first):
 
-1. **Inline config** - `servers:` block in your bundle's tool config (used by example)
-2. **Environment variable** - `$AMPLIFIER_MCP_CONFIG` pointing to a JSON file
-3. **Project config** - `.amplifier/mcp.json` in current directory (HTTP only)
-4. **User config** - `~/.amplifier/mcp.json` in home directory
+1. **Trusted host inline config** - reviewed `servers:` block (used by example)
+2. **Environment variable** - `$AMPLIFIER_MCP_CONFIG`, an absolute host-owned file outside the project
+3. **User config** - host-owned `~/.amplifier/mcp.json` in home directory
+
+Project definitions are ignored for both stdio and HTTP. See the
+[configuration policy and migration guide](../README.md#configuration-priority)
+for canonical-path checks, symlink/hardlink restrictions, and inline host trust.
 
 ### Customizing the Example
 
@@ -71,21 +74,22 @@ tools:
 
 ### Using External Configuration Files
 
-If you prefer to keep trusted stdio server configuration separate from your
-bundle, copy the reference file to your user configuration:
+If you prefer to keep trusted stdio and HTTP server configuration separate from
+your bundle, review the reference file and merge approved entries into your user
+configuration. Do not overwrite an existing file:
 
 ```bash
-# Copy the reference mcp.json to your user configuration
+# Review examples/mcp.json, then create/edit your user configuration
 mkdir -p ~/.amplifier
-cp examples/mcp.json ~/.amplifier/mcp.json
-# Edit ~/.amplifier/mcp.json to customize
+# Merge approved entries into ~/.amplifier/mcp.json manually
 
 # Then use a minimal bundle without inline config
 amplifier bundle use git+https://github.com/microsoft/amplifier-module-tool-mcp@main#subdirectory=behaviors/mcp.yaml
 ```
 
-Project-local `.amplifier/mcp.json` files may configure HTTP servers, but stdio
-commands are ignored to prevent a cloned repository from executing programs.
+Do not symlink user configuration into a project or select a project file using
+the environment variable. Make an independent, reviewed host-owned copy instead.
+HTTP endpoints and their credential headers need the same review as commands.
 
 ## Popular MCP Servers
 

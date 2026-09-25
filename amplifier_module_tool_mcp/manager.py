@@ -153,15 +153,7 @@ class MCPManager:
         self, server_name: str, server_config: dict[str, Any]
     ) -> None:
         """Start a stdio-based MCP server."""
-        if (
-            isinstance(server_config, MCPServerConfig)
-            and server_config.source == "project"
-        ):
-            logger.error(
-                "Refusing to execute stdio MCP server '%s' from project config. "
-                "Move the server definition to inline, environment, or user config.",
-                server_name,
-            )
+        if not self._has_host_provenance(server_name, server_config):
             return
 
         command = server_config.get("command")
@@ -196,6 +188,8 @@ class MCPManager:
         self, server_name: str, server_config: dict[str, Any]
     ) -> None:
         """Start a Streamable HTTP-based MCP server (2025-03-26 spec)."""
+        if not self._has_host_provenance(server_name, server_config):
+            return
         url = server_config.get("url")
         headers = server_config.get("headers", {})
 
@@ -215,6 +209,23 @@ class MCPManager:
         # Store client and register capabilities
         self.clients[server_name] = client
         await self._register_capabilities(server_name, client)
+
+    @staticmethod
+    def _has_host_provenance(server_name: str, server_config: dict[str, Any]) -> bool:
+        """Fail closed before expanding secrets or constructing either client."""
+        if isinstance(server_config, MCPServerConfig) and server_config.source in (
+            "user",
+            "environment",
+            "inline",
+        ):
+            return True
+        logger.error(
+            "Refusing MCP server '%s' without host-owned configuration. "
+            "Move reviewed definitions outside the project to user or absolute "
+            "environment config, or supply trusted host inline config.",
+            server_name,
+        )
+        return False
 
     async def _register_capabilities(
         self, server_name: str, client: MCPClient | MCPStreamableHTTPClient
