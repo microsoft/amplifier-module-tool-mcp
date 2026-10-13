@@ -2,6 +2,8 @@
 
 import logging
 import re
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from amplifier_core import ToolResult
@@ -9,9 +11,11 @@ from amplifier_core import ToolResult
 from amplifier_module_tool_mcp.content_utils import (
     DEFAULT_MAX_CONTENT_SIZE,
     extract_text_from_mcp_content,
-    truncate_content_if_needed,
 )
 from amplifier_module_tool_mcp.sdk_compat import MCPProtocolError, sdk_field
+from amplifier_module_tool_mcp.evidence import (
+    DEFAULT_ARTIFACT_DIR, present_evidence, validate_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,7 @@ class MCPToolWrapper:
         client: Any,
         hooks: Any,
         max_content_size: int = DEFAULT_MAX_CONTENT_SIZE,
+        artifact_dir: Path | None = None,
     ):
         """
         Initialize tool wrapper.
@@ -49,13 +54,18 @@ class MCPToolWrapper:
         self.client = client
         self.hooks = hooks
         self.max_content_size = max_content_size
+        validate_budget(max_content_size)
+        self.artifact_dir = artifact_dir or Path(DEFAULT_ARTIFACT_DIR).expanduser()
 
         # Extract tool info
         self.tool_name = tool_def["name"]
         tool_name_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", self.tool_name)
         self._name = f"mcp_{server_name}_{tool_name_clean}"
         self._description = tool_def.get("description", "")
-        self._input_schema = tool_def.get("input_schema", {})
+        self._input_schema = deepcopy(tool_def.get("input_schema", {}))
+        if not isinstance(self._input_schema, dict):
+            raise ValueError("Unsupported MCP input schema: expected a JSON schema object")
+        self.mcp_tool_definition = deepcopy(tool_def.get("mcp_tool_definition", tool_def))
 
     @property
     def name(self) -> str:
@@ -90,9 +100,6 @@ class MCPToolWrapper:
             # Call tool on MCP server
             result = await self.client.call_tool(self.tool_name, input)
 
-            # Extract content from result with size protection
-            content, was_truncated = self._extract_content(result)
-
             # structuredContent (1.x) / structured_content (2.x) is genuinely
             # optional -- a server may simply not return it -- so this reads
             # with a default rather than the fail-loud (no-default) form used
@@ -101,18 +108,24 @@ class MCPToolWrapper:
                 result, "structured_content", "structuredContent", default=None
             )
 
-            # ToolResult.output must be a dict, not a string
-            # Include MCP metadata for better log viewer experience
+            raw_text = extract_text_from_mcp_content(result.content)
+            output = present_evidence(
+                result, raw_text, structured_content,
+                self.max_content_size, self.artifact_dir,
+            )
+            output.update(mcp_server=self.server_name, mcp_tool=self.tool_name)
+            is_error = sdk_field(result, "is_error", "isError", default=False)
+            if type(is_error) is not bool:
+                raise ValueError("Unsupported MCP isError shape: expected boolean")
             return ToolResult(
-                success=True,
-                output={
-                    "content": content,
+                success=not is_error,
+                output=output,
+                error={
+                    "message": "MCP server returned isError; inspect output evidence",
+                    "mcp_is_error": True,
                     "mcp_server": self.server_name,
                     "mcp_tool": self.tool_name,
-                    "content_size_chars": len(content),
-                    "content_truncated": was_truncated,
-                    "structured_content": structured_content,
-                },
+                } if is_error else None,
             )
 
         except MCPProtocolError as e:
@@ -120,25 +133,40 @@ class MCPToolWrapper:
             # error code), as opposed to a transport failure. Surface the
             # code/data/explanation so a caller can distinguish the two.
             logger.error(
-                f"MCP tool '{self.name}' failed with protocol error {e.code}: {e.explanation}"
+                f"MCP tool '{self.name}' failed with protocol error {e.code}"
             )
             error_msg = str(e)
+            try:
+                output = present_evidence(
+                    {"message": error_msg, "code": e.code, "data": e.data,
+                     "explanation": e.explanation},
+                    error_msg, e.data, self.max_content_size, self.artifact_dir,
+                )
+            except Exception as recovery_error:
+                return ToolResult(
+                    success=False,
+                    output=str(recovery_error)[:self.max_content_size],
+                    error={"message": str(recovery_error)[:self.max_content_size],
+                           "mcp_error_code": e.code, "mcp_server": self.server_name,
+                           "mcp_tool": self.tool_name},
+                )
             return ToolResult(
                 success=False,
-                output=error_msg,
+                output=output,
                 error={
-                    "message": error_msg,
+                    "message": error_msg[:1024],
                     "mcp_server": self.server_name,
                     "mcp_tool": self.tool_name,
                     "mcp_error_code": e.code,
-                    "mcp_error_data": e.data,
-                    "mcp_error_explanation": e.explanation,
+                    "mcp_error_data": output["structured_content"],
+                    "mcp_error_explanation": e.explanation[:1024],
+                    "recovery": output.get("recovery"),
                 },
             )
 
         except Exception as e:
-            logger.error(f"MCP tool '{self.name}' failed: {e}")
-            error_msg = str(e)
+            error_msg = str(e)[:self.max_content_size]
+            logger.error(f"MCP tool '{self.name}' failed: {error_msg}")
             return ToolResult(
                 success=False,
                 output=error_msg,
@@ -148,32 +176,6 @@ class MCPToolWrapper:
                     "mcp_tool": self.tool_name,
                 },
             )
-
-    def _extract_content(self, result: Any) -> tuple[str, bool]:
-        """
-        Extract content from MCP tool result with size protection.
-
-        Args:
-            result: Raw result from MCP server
-
-        Returns:
-            Tuple of (content_string, was_truncated)
-        """
-        # Extract raw content
-        if hasattr(result, "content"):
-            # Result with content attribute (standard MCP format)
-            raw_content = extract_text_from_mcp_content(result.content)
-        else:
-            # Fallback: convert to string
-            raw_content = str(result)
-
-        # Apply size limit with truncation if needed
-        context_info = f"MCP tool '{self.name}'"
-        content, was_truncated = truncate_content_if_needed(
-            raw_content, self.max_content_size, context_info
-        )
-
-        return content, was_truncated
 
     def __repr__(self) -> str:
         """String representation."""

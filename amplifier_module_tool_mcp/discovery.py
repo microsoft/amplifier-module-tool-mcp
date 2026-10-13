@@ -26,6 +26,7 @@ from amplifier_module_tool_mcp.pagination import (
     list_all_tools,
 )
 from amplifier_module_tool_mcp.sdk_compat import MCP_ERROR_CLASS, sdk_field
+from amplifier_module_tool_mcp.evidence import json_value
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,10 @@ async def discover_tools(session: Any) -> list[dict[str, Any]]:
             "name": tool.name,
             "description": tool.description or "",
             "input_schema": sdk_field(tool, "input_schema", "inputSchema"),
+            "output_schema": sdk_field(tool, "output_schema", "outputSchema", default=None),
+            "annotations": json_value(sdk_field(tool, "annotations", default=None)),
+            "meta": json_value(sdk_field(tool, "meta", "_meta", default=None)),
+            "mcp_tool_definition": json_value(tool),
         }
         for tool in tools
     ]
