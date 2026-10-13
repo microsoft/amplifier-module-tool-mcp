@@ -18,6 +18,7 @@ from amplifier_module_tool_mcp.discovery import (
     discover_resources,
     discover_tools,
 )
+from amplifier_module_tool_mcp.policy import ToolPolicy
 from amplifier_module_tool_mcp.reconnection import (
     CircuitBreaker,
     ReconnectionConfig,
@@ -60,6 +61,7 @@ class MCPStreamableHTTPClient:
         url: str,
         headers: dict[str, str] | None = None,
         reconnection_config: ReconnectionConfig | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         """
         Initialize Streamable HTTP MCP client.
@@ -71,6 +73,8 @@ class MCPStreamableHTTPClient:
             reconnection_config: Reconnection configuration
         """
         self.server_name = server_name
+        self.tool_policy = tool_policy or ToolPolicy()
+        self._retired = False
         self.url = url
         self.headers = headers or {}
         self.session: ClientSession | None = None
@@ -254,6 +258,7 @@ class MCPStreamableHTTPClient:
 
     async def connect(self) -> None:
         """Connect to Streamable HTTP MCP server (starts background task)."""
+        self._require_active()
         if self._connection_task is not None:
             return  # Already connected
 
@@ -280,11 +285,10 @@ class MCPStreamableHTTPClient:
         )
 
         # Wait for ready signal with a hard timeout.
-        # asyncio.shield() keeps the background task alive even if the outer
-        # wait_for times out and raises TimeoutError here.
+        # Only the event waiter is timed out; the task is cancelled below.
         try:
             await asyncio.wait_for(
-                asyncio.shield(self._ready_event.wait()),
+                self._ready_event.wait(),
                 timeout=CONNECTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -305,6 +309,8 @@ class MCPStreamableHTTPClient:
         if self._connection_error:
             await self._connection_task
             self._connection_task = None
+            if isinstance(self._connection_error, (asyncio.CancelledError, ValueError)):
+                raise self._connection_error
             raise RuntimeError(
                 f"Streamable HTTP MCP server connection failed: {self._connection_error}"
             )
@@ -321,6 +327,10 @@ class MCPStreamableHTTPClient:
             return
 
         self.tools = await discover_tools(self.session)
+        if self.tool_policy.names is not None:
+            self.resources = []
+            self.prompts = []
+            return
         self.resources = await discover_resources(
             self.session, server_name=self.server_name
         )
@@ -330,9 +340,13 @@ class MCPStreamableHTTPClient:
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
+        self._require_active()
+        self.tool_policy.require_tool(tool_name)
         if not self._connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_tool(tool_name)
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()
@@ -386,9 +400,13 @@ class MCPStreamableHTTPClient:
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         if not self._connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         try:
             result = await self.session.read_resource(uri=uri)
             self._circuit_breaker.record_success()
@@ -422,9 +440,13 @@ class MCPStreamableHTTPClient:
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
         """Get a prompt from the MCP server."""
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         if not self._connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         try:
             result = await self.session.get_prompt(name=name, arguments=arguments or {})
             self._circuit_breaker.record_success()
@@ -501,6 +523,9 @@ class MCPStreamableHTTPClient:
 
         # Signal shutdown
         self._shutdown_event.set()
+        # A partial connection has not reached the shutdown wait yet.
+        if not self._ready_event.is_set():
+            self._connection_task.cancel()
 
         # Wait for clean exit
         try:
@@ -515,12 +540,20 @@ class MCPStreamableHTTPClient:
 
     def get_tools(self) -> list[dict[str, Any]]:
         """Get the list of discovered tools."""
-        return self.tools
+        return [tool for tool in self.tools if self.tool_policy.allows(tool["name"])]
 
     def get_resources(self) -> list[dict[str, Any]]:
         """Get the list of discovered resources."""
-        return self.resources
+        return self.resources if self.tool_policy.names is None else []
 
     def get_prompts(self) -> list[dict[str, Any]]:
         """Get the list of discovered prompts."""
-        return self.prompts
+        return self.prompts if self.tool_policy.names is None else []
+
+    def retire(self) -> None:
+        """Permanently revoke this mount's clients before manager teardown."""
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise PermissionError("MCP client belongs to a retired mount; cold remount required")

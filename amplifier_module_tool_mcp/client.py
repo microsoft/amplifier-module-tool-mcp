@@ -14,6 +14,7 @@ from amplifier_module_tool_mcp.discovery import (
     discover_resources,
     discover_tools,
 )
+from amplifier_module_tool_mcp.policy import ToolPolicy
 from amplifier_module_tool_mcp.reconnection import (
     CircuitBreaker,
     ReconnectionConfig,
@@ -70,6 +71,7 @@ class MCPClient:
         reconnection_config: ReconnectionConfig | None = None,
         verbose_servers: bool = False,
         server_log_dir: Path | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         """
         Initialize MCP client.
@@ -84,6 +86,8 @@ class MCPClient:
             server_log_dir: Directory for server logs when suppressed (default: ~/.amplifier/logs/mcp-servers/)
         """
         self.server_name = server_name
+        self.tool_policy = tool_policy or ToolPolicy()
+        self._retired = False
         self.command = command
         self.args = args
         self.env = env or {}
@@ -296,6 +300,7 @@ class MCPClient:
 
     async def connect(self) -> None:
         """Connect to MCP server (starts background task)."""
+        self._require_active()
         if self._connection_task is not None:
             return  # Already connected
 
@@ -333,6 +338,8 @@ class MCPClient:
             # instead of surfacing the opaque anyio "unhandled errors in a
             # TaskGroup (1 sub-exception)" wrapper.
             root_cause = self._connection_error
+            if isinstance(root_cause, (asyncio.CancelledError, ValueError)):
+                raise root_cause
             raise RuntimeError(
                 f"MCP server connection failed: {type(root_cause).__name__}: {root_cause}"
             ) from root_cause
@@ -358,9 +365,13 @@ class MCPClient:
         Returns:
             Tool execution result
         """
+        self._require_active()
+        self.tool_policy.require_tool(tool_name)
         if not self.is_connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_tool(tool_name)
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()
@@ -416,7 +427,7 @@ class MCPClient:
         self, tool_name: str, arguments: dict[str, Any]
     ) -> Any:
         """
-        Call a tool with automatic retry on failure.
+        Legacy entry point for a single tool dispatch (no automatic call retry).
 
         Args:
             tool_name: Name of the tool to call
@@ -426,12 +437,9 @@ class MCPClient:
             Tool execution result
         """
 
-        async def _call() -> Any:
-            return await self.call_tool(tool_name, arguments)
-
-        return await self._reconnection_strategy.execute_with_retry(
-            _call, f"call tool {tool_name} on {self.server_name}"
-        )
+        # Calls may have side effects. A protocol/tool failure must not dispatch
+        # a substitute or repeat the call; keep this legacy entry point single-shot.
+        return await self.call_tool(tool_name, arguments)
 
     async def _discover_capabilities(self) -> None:
         """Discover tools, resources, and prompts from server.
@@ -445,6 +453,10 @@ class MCPClient:
             return
 
         self.tools = await discover_tools(self.session)
+        if self.tool_policy.names is not None:
+            self.resources = []
+            self.prompts = []
+            return
         self.resources = await discover_resources(
             self.session, server_name=self.server_name
         )
@@ -454,9 +466,13 @@ class MCPClient:
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         if not self.is_connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         try:
             result = await self.session.read_resource(uri=uri)
             self._circuit_breaker.record_success()
@@ -490,9 +506,13 @@ class MCPClient:
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
         """Get a prompt from the MCP server."""
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         if not self.is_connected or not self.session:
             await self.connect()
 
+        self._require_active()
+        self.tool_policy.require_auxiliary()
         try:
             result = await self.session.get_prompt(name=name, arguments=arguments or {})
             self._circuit_breaker.record_success()
@@ -569,6 +589,9 @@ class MCPClient:
 
         # Signal shutdown
         self._shutdown_event.set()
+        # A partial connection has not reached the shutdown wait yet.
+        if not self._ready_event.is_set():
+            self._connection_task.cancel()
 
         # Wait for clean exit
         try:
@@ -586,12 +609,20 @@ class MCPClient:
 
     def get_tools(self) -> list[dict[str, Any]]:
         """Get the list of discovered tools."""
-        return self.tools
+        return [tool for tool in self.tools if self.tool_policy.allows(tool["name"])]
 
     def get_resources(self) -> list[dict[str, Any]]:
         """Get the list of discovered resources."""
-        return self.resources
+        return self.resources if self.tool_policy.names is None else []
 
     def get_prompts(self) -> list[dict[str, Any]]:
         """Get the list of discovered prompts."""
-        return self.prompts
+        return self.prompts if self.tool_policy.names is None else []
+
+    def retire(self) -> None:
+        """Permanently revoke this mount's clients before manager teardown."""
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise PermissionError("MCP client belongs to a retired mount; cold remount required")

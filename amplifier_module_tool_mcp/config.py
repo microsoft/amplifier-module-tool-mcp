@@ -49,7 +49,13 @@ class MCPConfig:
             self._load_from_env(),
             self._load_from_inline(),
         ]:
+            if config is not None and not isinstance(config, dict):
+                raise ValueError("MCP config must be a JSON object")
             if config and "mcpServers" in config:
+                if not isinstance(config["mcpServers"], dict):
+                    raise ValueError("MCP mcpServers must be an object")
+                if any(not isinstance(value, dict) for value in config["mcpServers"].values()):
+                    raise ValueError("Each MCP server config must be an object")
                 servers.update(config["mcpServers"])
 
         logger.info(f"Loaded {len(servers)} MCP server configurations")
@@ -89,7 +95,7 @@ class MCPConfig:
             source: Source name for logging
 
         Returns:
-            Parsed JSON or None if file doesn't exist or is invalid
+            Parsed JSON or None if file doesn't exist; invalid files fail closed
         """
         if not path.exists():
             logger.debug(f"No {source} config at {path}")
@@ -103,11 +109,14 @@ class MCPConfig:
             # BOM if present and is identical to utf-8 otherwise.
             with open(path, encoding="utf-8-sig") as f:
                 config = json.load(f)
+            if not isinstance(config, dict):
+                raise ValueError("MCP config file must contain a JSON object")
             logger.debug(f"Loaded MCP config from {source}: {path}")
             return config
         except Exception as e:
-            logger.warning(f"Failed to load {source} config from {path}: {e}")
-            return None
+            # Falling back after parse failure can discard a higher-priority
+            # restriction and enable an unrestricted lower-priority server.
+            raise ValueError(f"Failed to load {source} MCP config from {path}: {e}") from e
 
     @staticmethod
     def substitute_env_vars(value: str) -> str:

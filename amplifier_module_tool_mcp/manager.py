@@ -9,12 +9,18 @@ from typing import Any
 from amplifier_module_tool_mcp.client import MCPClient
 from amplifier_module_tool_mcp.config import MCPConfig
 from amplifier_module_tool_mcp.content_utils import DEFAULT_MAX_CONTENT_SIZE
+from amplifier_module_tool_mcp.evidence import DEFAULT_ARTIFACT_DIR, validate_budget
+from amplifier_module_tool_mcp.policy import validate_server_policy
 from amplifier_module_tool_mcp.prompt_wrapper import MCPPromptWrapper
 from amplifier_module_tool_mcp.resource_wrapper import MCPResourceWrapper
 from amplifier_module_tool_mcp.streamable_http_client import MCPStreamableHTTPClient
 from amplifier_module_tool_mcp.wrapper import MCPToolWrapper
 
 logger = logging.getLogger(__name__)
+
+
+class NamespaceCollisionError(ValueError):
+    """Ambiguous mounted names must not silently select a different capability."""
 
 
 class MCPManager:
@@ -59,6 +65,8 @@ class MCPManager:
 
         # Content size limit to prevent context exhaustion
         self.max_content_size = config.get("max_content_size", DEFAULT_MAX_CONTENT_SIZE)
+        validate_budget(self.max_content_size)
+        self.artifact_dir = Path(config.get("artifact_dir", DEFAULT_ARTIFACT_DIR)).expanduser()
         logger.debug(f"Content size limit: {self.max_content_size:,} characters")
 
     async def start(self) -> None:
@@ -75,6 +83,10 @@ class MCPManager:
 
         # Load server configurations
         servers = self.config.load_servers()
+        # Validate all opted-in policies before any connection/spawn, including
+        # another server that happens to precede the invalid entry.
+        for server_config in servers.values():
+            validate_server_policy(server_config)
 
         if not servers:
             logger.debug("No MCP servers configured - MCP capabilities inactive")
@@ -84,7 +96,26 @@ class MCPManager:
         for server_name, server_config in servers.items():
             try:
                 await self._start_server(server_name, server_config)
-            except (Exception, asyncio.CancelledError) as e:
+            except asyncio.CancelledError:
+                try:
+                    await self.stop()
+                except BaseException:
+                    logger.exception("MCP cleanup failed while unwinding cancellation")
+                raise
+            except ValueError:
+                try:
+                    await self.stop()
+                except BaseException:
+                    logger.exception("MCP cleanup failed while unwinding invalid registration/config")
+                raise
+            except Exception as e:
+                # Ordinary transport failures keep the legacy healthy-server
+                # continuation, but never retain a failed partial connection.
+                client = self.clients.get(server_name)
+                if client is not None:
+                    client.retire()
+                    await client.disconnect()
+                    self.clients.pop(server_name, None)
                 logger.error(f"Failed to start MCP server '{server_name}': {e}")
                 # Continue with other servers
 
@@ -174,11 +205,11 @@ class MCPManager:
             env,
             verbose_servers=self.verbose_servers,
             server_log_dir=self.server_log_dir,
+            tool_policy=validate_server_policy(server_config),
         )
-        await client.connect()
-
-        # Store client and register capabilities
+        # Track before connect so cancellation can retire/drain partial startup.
         self.clients[server_name] = client
+        await client.connect()
         await self._register_capabilities(server_name, client)
 
     async def _start_streamable_http_server(
@@ -198,11 +229,11 @@ class MCPManager:
         headers = {k: MCPConfig.substitute_env_vars(v) for k, v in headers.items()}
 
         # Create and connect client
-        client = MCPStreamableHTTPClient(server_name, url, headers)
-        await client.connect()
-
-        # Store client and register capabilities
+        client = MCPStreamableHTTPClient(
+            server_name, url, headers, tool_policy=validate_server_policy(server_config)
+        )
         self.clients[server_name] = client
+        await client.connect()
         await self._register_capabilities(server_name, client)
 
     async def _register_capabilities(
@@ -215,6 +246,17 @@ class MCPManager:
             server_name: Server name
             client: Connected MCP client
         """
+        pending_tools = {}
+        pending_resources = {}
+        pending_prompts = {}
+        names = set(self.get_all_capabilities())
+
+        def register(registry, wrapper):
+            if wrapper.name in names:
+                raise NamespaceCollisionError(f"Ambiguous MCP mounted name: {wrapper.name}")
+            names.add(wrapper.name)
+            registry[wrapper.name] = wrapper
+
         # Register tools - pass hooks for event emission and content size limit
         for tool_def in client.get_tools():
             wrapper = MCPToolWrapper(
@@ -223,8 +265,9 @@ class MCPManager:
                 client,
                 self.coordinator.hooks,
                 max_content_size=self.max_content_size,
+                artifact_dir=self.artifact_dir,
             )
-            self.tools[wrapper.name] = wrapper
+            register(pending_tools, wrapper)
             logger.debug(
                 f"Registered tool '{wrapper.name}' from server '{server_name}'"
             )
@@ -238,7 +281,7 @@ class MCPManager:
                 self.coordinator.hooks,
                 max_content_size=self.max_content_size,
             )
-            self.resources[wrapper.name] = wrapper
+            register(pending_resources, wrapper)
             logger.debug(
                 f"Registered resource '{wrapper.name}' from server '{server_name}'"
             )
@@ -252,14 +295,20 @@ class MCPManager:
                 self.coordinator.hooks,
                 max_content_size=self.max_content_size,
             )
-            self.prompts[wrapper.name] = wrapper
+            register(pending_prompts, wrapper)
             logger.debug(
                 f"Registered prompt '{wrapper.name}' from server '{server_name}'"
             )
+        # Commit this server's catalogue only after every name is unambiguous.
+        self.tools.update(pending_tools)
+        self.resources.update(pending_resources)
+        self.prompts.update(pending_prompts)
 
     async def stop(self) -> None:
         """Stop all MCP servers cleanly."""
         logger.info("Stopping MCP manager...")
+        for client in self.clients.values():
+            client.retire()
 
         # Disconnect all servers in parallel
         await asyncio.gather(
