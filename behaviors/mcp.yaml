@@ -15,13 +15,14 @@ tools:
       # Content exceeding this limit is automatically truncated with a notice
       max_content_size: 50000  # Maximum chars (~12k tokens, default: 50000)
       
-      # Optional inline server config (overrides .amplifier/mcp.json)
-      # Most users configure servers in .amplifier/mcp.json instead
-      # Default server discovery:
-      #   1. Inline servers (here)
-      #   2. Project config: .amplifier/mcp.json
-      #   3. User config: ~/.amplifier/mcp.json
-      #   4. Environment: AMPLIFIER_MCP_CONFIG
+      # Optional trusted host inline config (overrides external configuration)
+      # Most users configure servers in host-owned ~/.amplifier/mcp.json
+      # Server discovery, highest priority first:
+      #   1. Trusted host inline servers (here; review bundles before use)
+      #   2. AMPLIFIER_MCP_CONFIG: absolute host-owned file outside the project
+      #   3. Host-owned user config: ~/.amplifier/mcp.json
+      # Project discovery is disabled for both stdio and HTTP.
+      # Project paths, symlink aliases into projects, and hardlinks are rejected.
       # servers:
       #   postgres:
       #     command: npx

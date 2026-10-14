@@ -9,15 +9,25 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class MCPServerConfig(dict[str, Any]):
+    """Server configuration with trusted loader provenance."""
+
+    def __init__(self, config: dict[str, Any], source: str):
+        super().__init__(config)
+        self.source = source
+
+
 class MCPConfig:
     """
     Handles loading and resolution of MCP server configuration.
 
     Configuration can come from multiple sources (in priority order):
     1. Inline config (passed directly to module)
-    2. Environment variable (AMPLIFIER_MCP_CONFIG) - explicit override
-    3. Project config (.amplifier/mcp.json)
-    4. User config (~/.amplifier/mcp.json) - personal defaults
+    2. Absolute environment-selected config outside the project
+    3. User config (~/.amplifier/mcp.json) - personal defaults
+
+    Project files are not a source of server authority, for either transport.
+    Inline configuration must be supplied by a trusted host, not a project bundle.
 
     This follows amplifier-foundation conventions where env vars are
     overrides (high priority), not fallbacks.
@@ -31,26 +41,64 @@ class MCPConfig:
             inline_config: Optional inline configuration from profile
         """
         self.inline_config = inline_config or {}
+        # Freeze host locators and retain the original project boundary even if
+        # the caller changes cwd before starting (or restarting) the manager.
+        self._home = Path.home().resolve()
+        self._project_roots: set[Path] = set()
+        self._remember_project()
+        self._env_path = os.environ.get("AMPLIFIER_MCP_CONFIG")
 
-    def load_servers(self) -> dict[str, dict[str, Any]]:
+    def _remember_project(self) -> None:
+        """Remember cwd's project root without running git or reading config."""
+        cwd = Path.cwd().resolve()
+        # Running from HOME is not project discovery. Its user config remains
+        # usable, but a real checkout rooted at HOME still counts as a project.
+        config_root = None
+        for directory in (cwd, *cwd.parents):
+            if (directory / ".git").exists():
+                self._project_roots.add(directory)
+                return
+            if directory != self._home and (directory / ".amplifier").is_dir():
+                config_root = directory
+            if directory == self._home:
+                break
+        if cwd != self._home:
+            self._project_roots.add(config_root or cwd)
+
+    def load_servers(self) -> dict[str, MCPServerConfig]:
         """
         Load MCP server configurations from all sources.
 
         Returns:
             Dictionary mapping server names to their configurations
         """
-        servers = {}
+        servers: dict[str, MCPServerConfig] = {}
+        self._remember_project()
 
         # Load from each source (reverse priority order, so higher priority overwrites)
-        # Priority: inline > env > project > user (matches foundation conventions)
-        for config in [
-            self._load_from_user_config(),
-            self._load_from_project_config(),
-            self._load_from_env(),
-            self._load_from_inline(),
+        # Project entries cannot shadow host-owned definitions.
+        for source, config in [
+            ("user", self._load_from_user_config()),
+            ("environment", self._load_from_env()),
+            ("inline", self._load_from_inline()),
         ]:
             if config and "mcpServers" in config:
-                servers.update(config["mcpServers"])
+                if not isinstance(config["mcpServers"], dict):
+                    logger.warning(
+                        "Ignoring %s MCP config: mcpServers must be an object", source
+                    )
+                    continue
+                for server_name, server_config in config["mcpServers"].items():
+                    if not isinstance(server_config, dict):
+                        logger.warning(
+                            "Ignoring MCP server '%s' from %s config: "
+                            "configuration must be an object",
+                            server_name,
+                            source,
+                        )
+                        continue
+
+                    servers[server_name] = MCPServerConfig(server_config, source)
 
         logger.info(f"Loaded {len(servers)} MCP server configurations")
         return servers
@@ -62,23 +110,69 @@ class MCPConfig:
             return {"mcpServers": self.inline_config["servers"]}
         return None
 
-    def _load_from_project_config(self) -> dict[str, Any] | None:
-        """Load configuration from .amplifier/mcp.json in current directory."""
-        config_path = Path.cwd() / ".amplifier" / "mcp.json"
-        return self._load_json_file(config_path, "project")
-
     def _load_from_user_config(self) -> dict[str, Any] | None:
         """Load configuration from ~/.amplifier/mcp.json."""
-        config_path = Path.home() / ".amplifier" / "mcp.json"
-        return self._load_json_file(config_path, "user")
+        return self._load_host_file(self._home / ".amplifier" / "mcp.json", "user")
 
     def _load_from_env(self) -> dict[str, Any] | None:
-        """Load configuration from environment variable."""
-        config_path_str = os.environ.get("AMPLIFIER_MCP_CONFIG")
-        if config_path_str:
-            config_path = Path(config_path_str)
-            return self._load_json_file(config_path, "environment")
+        """Load an absolute host-owned config, never a cwd-relative locator."""
+        if self._env_path:
+            return self._load_host_file(Path(self._env_path), "environment")
         return None
+
+    def _load_host_file(self, path: Path, source: str) -> dict[str, Any] | None:
+        """Validate the locator AND its canonical target before reading content.
+
+        Host-selected files outside project roots are authority. Symlinks into
+        a project and hard-linked files are not a migration to host ownership.
+        This is not a sandbox against another process running as the host user.
+        """
+        try:
+            if not path.is_absolute():
+                raise ValueError("configuration path must be absolute")
+            canonical = self._resolve_host_path(path)
+            stat = canonical.stat()
+            if not canonical.is_file() or stat.st_nlink != 1:
+                raise ValueError(
+                    "configuration must be a regular, non-hard-linked file"
+                )
+            if os.name == "posix" and stat.st_uid not in (0, os.getuid()):
+                raise ValueError("configuration must be owned by the host user or root")
+            return self._load_json_file(canonical, source)
+        except FileNotFoundError:
+            return None
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Ignoring %s MCP config at %s: %s", source, path, exc)
+            return None
+
+    def _resolve_host_path(self, path: Path) -> Path:
+        """Check symlink hops too, not just the final canonical destination.
+
+        A host alias -> project link -> host file still depends on a project
+        controlled selector and must not grant authority to that selector.
+        """
+        pending = [path]
+        checked: set[Path] = set()
+        canonical = path.resolve(strict=True)
+        while pending:
+            candidate = pending.pop()
+            if candidate in checked:
+                continue
+            checked.add(candidate)
+            resolved = candidate.resolve(strict=True)
+            if any(
+                location.is_relative_to(root)
+                for root in self._project_roots
+                for location in (candidate, Path(os.path.abspath(candidate)), resolved)
+            ):
+                raise ValueError("configuration must be outside project roots")
+            for prefix in (candidate, *candidate.parents):
+                if prefix.is_symlink():
+                    target = prefix.readlink()
+                    pending.append(
+                        target if target.is_absolute() else prefix.parent / target
+                    )
+        return canonical
 
     def _load_json_file(self, path: Path, source: str) -> dict[str, Any] | None:
         """
@@ -103,6 +197,9 @@ class MCPConfig:
             # BOM if present and is identical to utf-8 otherwise.
             with open(path, encoding="utf-8-sig") as f:
                 config = json.load(f)
+            if not isinstance(config, dict):
+                logger.warning("Ignoring %s MCP config: root must be an object", source)
+                return None
             logger.debug(f"Loaded MCP config from {source}: {path}")
             return config
         except Exception as e:

@@ -79,12 +79,19 @@ async def test_repomix_connection():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not shutil.which("npx"), reason="npx not available")
-async def test_manager_with_real_server(test_mcp_config, monkeypatch, mock_coordinator):
+async def test_manager_with_real_server(mock_coordinator):
     """Test MCPManager with real server configuration."""
-    # Change to test directory
-    monkeypatch.chdir(test_mcp_config)
-
-    manager = MCPManager({}, mock_coordinator)
+    manager = MCPManager(
+        {
+            "servers": {
+                "repomix": {
+                    "command": "npx",
+                    "args": ["-y", "repomix", "--mcp"],
+                }
+            }
+        },
+        mock_coordinator,
+    )
 
     try:
         # Start manager

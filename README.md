@@ -113,7 +113,7 @@ includes:
 - ✅ MCP tool module configured with production defaults
 - ✅ Content size protection enabled (50k char limit)
 - ✅ Clean console output (server logs saved to files)
-- ✅ Automatic server discovery from `.amplifier/mcp.json`
+- Server discovery from host-owned `~/.amplifier/mcp.json`
 - ✅ Clean dependency chain (no redundant includes)
 
 **Why this pattern?**
@@ -170,7 +170,10 @@ includes:
 
 ### 2. Configure MCP Servers
 
-Create `.amplifier/mcp.json`:
+Define both stdio and HTTP servers in host-owned `~/.amplifier/mcp.json` or
+trusted host inline configuration. Project-local `.amplifier/mcp.json` files
+are ignored: repositories cannot authorize process execution, outbound
+connections, host-secret expansion, or replacement of trusted server names.
 
 ```json
 {
@@ -237,7 +240,7 @@ tools:
       # Content size protection (prevents context exhaustion)
       max_content_size: 50000  # Default: 50k chars (~12k tokens)
 
-      # Optional inline server config (overrides .amplifier/mcp.json)
+      # Optional trusted host inline server config (overrides external config)
       servers:
         my-server:
           command: npx
@@ -251,7 +254,7 @@ tools:
 | `verbose_servers` | `false` | Show MCP server stderr output in console |
 | `server_log_dir` | `~/.amplifier/logs/mcp-servers/` | Directory for server logs when suppressed |
 | `max_content_size` | `50000` | Maximum content size in characters. Content exceeding this limit is automatically truncated with a notice to prevent context window exhaustion |
-| `servers` | (optional) | Inline server configuration (overrides .amplifier/mcp.json) |
+| `servers` | (optional) | Trusted inline server configuration (overrides external configuration) |
 
 **Environment variable override**:
 ```bash
@@ -273,10 +276,53 @@ AMPLIFIER_MCP_VERBOSE=true amplifier run "test"
 
 ### Configuration Priority
 
-1. **Inline config** (servers in bundle config) - highest priority
-2. **Project config** (`.amplifier/mcp.json`) - recommended
-3. **User config** (`~/.amplifier/mcp.json`) - fallback
-4. **Environment variable** (`AMPLIFIER_MCP_CONFIG`) - override
+1. **Trusted host inline config** (servers in module config) - highest priority
+2. **Environment variable** (`AMPLIFIER_MCP_CONFIG`) - absolute host-owned config path
+3. **User config** (`~/.amplifier/mcp.json`) - personal defaults
+
+**Project discovery is disabled for both transports.** HTTP server definitions
+can send configured headers containing host environment secrets as soon as the
+manager starts, even before any tool is called. There is no project opt-in flag;
+fields such as `trusted`, `approved`, or `source` in JSON do not authorize a server.
+
+### Migrating project definitions
+
+Review the exact command/arguments or HTTP URL/headers and environment references.
+Copy only approved definitions into your existing `~/.amplifier/mcp.json`
+(`mcpServers` object), preserving its other servers. Alternatively, save reviewed
+definitions in a separate host-controlled file outside the project and select it:
+
+```bash
+export AMPLIFIER_MCP_CONFIG="$HOME/.config/amplifier/mcp.json"
+```
+
+Create that file yourself; the module does not create or migrate it. Relative
+environment paths (including literal `~/...`) are rejected rather than resolved
+against whichever repository happens to be current. The shell-expanded `$HOME`
+example above is absolute.
+
+Both the selected path and its canonical symlink target must be outside project
+roots. A project root is the nearest enclosing Git checkout (including worktrees),
+otherwise an enclosing `.amplifier` directory's parent, otherwise the working
+directory. The loader remembers the construction-time root and roots observed
+at subsequent loads, so changing cwd cannot relabel a known project file.
+Ordinary HOME is not itself a project, unless it is a Git checkout.
+Host locators are captured when the manager is constructed; recreate it after
+changing HOME or `AMPLIFIER_MCP_CONFIG`.
+
+Pointing an absolute environment path or a user-config symlink into the project
+does not grant trust. Hard-linked config files are also rejected; make an
+independent reviewed copy instead. On POSIX, files must be owned by the current
+user or root. Host-only symlinks outside
+project roots remain supported. Invalid files are ignored with a warning, and
+cannot shadow valid lower-priority host definitions.
+
+The host must protect selected files and their parent directories from untrusted
+writes. These checks are not a sandbox against code already running as the host
+user, nor approval of arbitrary URLs/commands outside the project. Inline config
+is a **host API trust boundary**: the caller must not pass unreviewed project
+bundle contents as trusted inline `servers`. This module cannot establish the
+provenance of a dictionary supplied by its host.
 
 ## Usage
 
@@ -312,7 +358,7 @@ Use postgres tools for database operations.
 Use puppeteer tools for web scraping and automation.
 ```
 
-With `.amplifier/mcp.json`:
+With trusted inline or user configuration:
 ```json
 {
   "mcpServers": {
