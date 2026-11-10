@@ -61,7 +61,7 @@ class MCPManager:
         self.max_content_size = config.get("max_content_size", DEFAULT_MAX_CONTENT_SIZE)
         logger.debug(f"Content size limit: {self.max_content_size:,} characters")
 
-    async def start(self) -> None:
+    async def start(self, *, ephemeral_servers: dict[str, Any] | None = None) -> None:
         """
         Start all configured MCP servers and discover their capabilities.
 
@@ -76,17 +76,44 @@ class MCPManager:
         # Load server configurations
         servers = self.config.load_servers()
 
-        if not servers:
+        # Only a trusted host supplies this transient supplement. Keep it out
+        # of MCPConfig: headers and leases must not become saved configuration.
+        ephemeral = {} if ephemeral_servers is None else ephemeral_servers
+        if not isinstance(ephemeral, dict) or any(
+            not isinstance(name, str) or not name or not isinstance(value, dict)
+            for name, value in ephemeral.items()
+        ):
+            raise ValueError("Ephemeral MCP servers must be a named configuration map")
+        if servers.keys() & ephemeral.keys():
+            raise ValueError("Ephemeral MCP servers conflict with configured servers")
+
+        if not servers and not ephemeral:
             logger.debug("No MCP servers configured - MCP capabilities inactive")
             return
 
-        # Start each server
-        for server_name, server_config in servers.items():
-            try:
-                await self._start_server(server_name, server_config)
-            except (Exception, asyncio.CancelledError) as e:
-                logger.error(f"Failed to start MCP server '{server_name}': {e}")
-                # Continue with other servers
+        try:
+            # Ordinary configuration retains its best-effort startup policy.
+            for server_name, server_config in servers.items():
+                try:
+                    await self._start_server(server_name, server_config)
+                except Exception as e:
+                    logger.error(f"Failed to start MCP server '{server_name}': {e}")
+
+            # Requested attachments are all-or-nothing, before provider admission.
+            for server_name, server_config in ephemeral.items():
+                try:
+                    await self._start_server(
+                        server_name, MCPServerConfig(server_config, "inline"),
+                        ephemeral=True,
+                    )
+                    if server_name not in self.clients:
+                        raise ValueError("MCP attachment did not connect")
+                except Exception:
+                    # Transport exceptions may contain transient connection data.
+                    raise RuntimeError("Ephemeral MCP attachment failed") from None
+        except BaseException:
+            await self.stop()
+            raise
 
         logger.info(
             f"MCP manager started: {len(self.tools)} tools, {len(self.resources)} resources, "
@@ -94,7 +121,7 @@ class MCPManager:
         )
 
     async def _start_server(
-        self, server_name: str, server_config: dict[str, Any]
+        self, server_name: str, server_config: dict[str, Any], *, ephemeral: bool = False
     ) -> None:
         """
         Start a single MCP server and discover its capabilities.
@@ -107,10 +134,14 @@ class MCPManager:
         transport_type = self._detect_transport_type(server_config)
 
         if transport_type == "streamable-http":
-            await self._start_streamable_http_server(server_name, server_config)
+            await self._start_streamable_http_server(
+                server_name, server_config, ephemeral=ephemeral
+            )
         elif transport_type == "stdio":
-            await self._start_stdio_server(server_name, server_config)
+            await self._start_stdio_server(server_name, server_config, ephemeral=ephemeral)
         else:
+            if ephemeral:
+                raise ValueError("Unsupported MCP attachment transport")
             logger.error(
                 f"Unknown transport type '{transport_type}' for server '{server_name}'"
             )
@@ -150,7 +181,7 @@ class MCPManager:
         return "stdio"
 
     async def _start_stdio_server(
-        self, server_name: str, server_config: dict[str, Any]
+        self, server_name: str, server_config: dict[str, Any], *, ephemeral: bool = False
     ) -> None:
         """Start a stdio-based MCP server."""
         if not self._has_host_provenance(server_name, server_config):
@@ -177,15 +208,12 @@ class MCPManager:
             env,
             verbose_servers=self.verbose_servers,
             server_log_dir=self.server_log_dir,
+            **({"redact_connection_details": True} if ephemeral else {}),
         )
-        await client.connect()
-
-        # Store client and register capabilities
-        self.clients[server_name] = client
-        await self._register_capabilities(server_name, client)
+        await self._connect_client(server_name, client)
 
     async def _start_streamable_http_server(
-        self, server_name: str, server_config: dict[str, Any]
+        self, server_name: str, server_config: dict[str, Any], *, ephemeral: bool = False
     ) -> None:
         """Start a Streamable HTTP-based MCP server (2025-03-26 spec)."""
         if not self._has_host_provenance(server_name, server_config):
@@ -203,12 +231,26 @@ class MCPManager:
         headers = {k: MCPConfig.substitute_env_vars(v) for k, v in headers.items()}
 
         # Create and connect client
-        client = MCPStreamableHTTPClient(server_name, url, headers)
-        await client.connect()
+        client = MCPStreamableHTTPClient(
+            server_name, url, headers,
+            **({"redact_connection_details": True} if ephemeral else {}),
+        )
+        await self._connect_client(server_name, client)
 
-        # Store client and register capabilities
+    async def _connect_client(
+        self, server_name: str, client: MCPClient | MCPStreamableHTTPClient
+    ) -> None:
+        """Own the connection before the first await, including failed discovery."""
         self.clients[server_name] = client
-        await self._register_capabilities(server_name, client)
+        try:
+            await client.connect()
+            await self._register_capabilities(server_name, client)
+        except BaseException:
+            try:
+                await client.disconnect()
+            finally:
+                self.clients.pop(server_name, None)
+            raise
 
     @staticmethod
     def _has_host_provenance(server_name: str, server_config: dict[str, Any]) -> bool:
@@ -237,47 +279,27 @@ class MCPManager:
             server_name: Server name
             client: Connected MCP client
         """
-        # Register tools - pass hooks for event emission and content size limit
-        for tool_def in client.get_tools():
-            wrapper = MCPToolWrapper(
-                server_name,
-                tool_def,
-                client,
-                self.coordinator.hooks,
-                max_content_size=self.max_content_size,
-            )
-            self.tools[wrapper.name] = wrapper
-            logger.debug(
-                f"Registered tool '{wrapper.name}' from server '{server_name}'"
-            )
-
-        # Register resources - pass hooks for event emission and content size limit
-        for resource_def in client.get_resources():
-            wrapper = MCPResourceWrapper(
-                server_name,
-                resource_def,
-                client,
-                self.coordinator.hooks,
-                max_content_size=self.max_content_size,
-            )
-            self.resources[wrapper.name] = wrapper
-            logger.debug(
-                f"Registered resource '{wrapper.name}' from server '{server_name}'"
-            )
-
-        # Register prompts - pass hooks for event emission and content size limit
-        for prompt_def in client.get_prompts():
-            wrapper = MCPPromptWrapper(
-                server_name,
-                prompt_def,
-                client,
-                self.coordinator.hooks,
-                max_content_size=self.max_content_size,
-            )
-            self.prompts[wrapper.name] = wrapper
-            logger.debug(
-                f"Registered prompt '{wrapper.name}' from server '{server_name}'"
-            )
+        # All primitives share the coordinator's tool namespace. Build and
+        # validate the complete set before changing any registry: sanitization
+        # can turn distinct server/tool names into the same mounted name.
+        names = set(self.get_all_capabilities())
+        pending = []
+        for definitions, wrapper_type, registry in (
+            (client.get_tools(), MCPToolWrapper, self.tools),
+            (client.get_resources(), MCPResourceWrapper, self.resources),
+            (client.get_prompts(), MCPPromptWrapper, self.prompts),
+        ):
+            for definition in definitions:
+                wrapper = wrapper_type(
+                    server_name, definition, client, self.coordinator.hooks,
+                    max_content_size=self.max_content_size,
+                )
+                if wrapper.name in names:
+                    raise ValueError("MCP capability names conflict")
+                names.add(wrapper.name)
+                pending.append((registry, wrapper))
+        for registry, wrapper in pending:
+            registry[wrapper.name] = wrapper
 
     async def stop(self) -> None:
         """Stop all MCP servers cleanly."""

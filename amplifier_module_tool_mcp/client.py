@@ -70,6 +70,8 @@ class MCPClient:
         reconnection_config: ReconnectionConfig | None = None,
         verbose_servers: bool = False,
         server_log_dir: Path | None = None,
+        *,
+        redact_connection_details: bool = False,
     ):
         """
         Initialize MCP client.
@@ -82,11 +84,13 @@ class MCPClient:
             reconnection_config: Reconnection configuration (uses defaults if None)
             verbose_servers: Whether to show server stderr output (default: False)
             server_log_dir: Directory for server logs when suppressed (default: ~/.amplifier/logs/mcp-servers/)
+            redact_connection_details: Hide transient transport details in diagnostics
         """
         self.server_name = server_name
         self.command = command
         self.args = args
         self.env = env or {}
+        self.redact_connection_details = redact_connection_details
         self.session: ClientSession | None = None
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
@@ -155,8 +159,16 @@ class MCPClient:
             "tools_discovered": len(self.tools),
             "resources_discovered": len(self.resources),
             "prompts_discovered": len(self.prompts),
-            "last_error": str(self._last_error) if self._last_error else None,
+            "last_error": (
+                self._error_detail(self._last_error) if self._last_error else None
+            ),
         }
+
+    def _error_detail(self, error: BaseException) -> str:
+        return type(error).__name__ if self.redact_connection_details else str(error)
+
+    def _error_cause(self, error: BaseException) -> BaseException | None:
+        return None if self.redact_connection_details else error
 
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
@@ -282,7 +294,10 @@ class MCPClient:
                 logger.debug(f"Connection task for '{self.server_name}' was cancelled")
             else:
                 # Include log file location in error message if suppressed
-                error_msg = f"Failed to connect to MCP server '{self.server_name}': {root_cause}"
+                error_msg = (
+                    f"Failed to connect to MCP server '{self.server_name}': "
+                    f"{self._error_detail(root_cause)}"
+                )
                 if not self.verbose_servers:
                     log_file_path = self.server_log_dir / f"{self.server_name}.log"
                     error_msg += f"\nServer logs available at: {log_file_path}"
@@ -321,8 +336,15 @@ class MCPClient:
             self._connection_task_impl(), name=f"mcp-{self.server_name}"
         )
 
-        # Wait for ready signal
-        await self._ready_event.wait()
+        # Cancellation before readiness still owns the connection task. Join its
+        # transport cleanup before returning control to the mounting caller.
+        try:
+            await self._ready_event.wait()
+        except asyncio.CancelledError:
+            self._connection_task.cancel()
+            await asyncio.gather(self._connection_task, return_exceptions=True)
+            self._connection_task = None
+            raise
 
         # Check for startup errors
         if self._connection_error:
@@ -333,9 +355,12 @@ class MCPClient:
             # instead of surfacing the opaque anyio "unhandled errors in a
             # TaskGroup (1 sub-exception)" wrapper.
             root_cause = self._connection_error
+            detail = self._error_detail(root_cause)
+            if not self.redact_connection_details:
+                detail = f"{type(root_cause).__name__}: {detail}"
             raise RuntimeError(
-                f"MCP server connection failed: {type(root_cause).__name__}: {root_cause}"
-            ) from root_cause
+                f"MCP server connection failed: {detail}"
+            ) from self._error_cause(root_cause)
 
     async def connect_with_retry(self) -> None:
         """Connect with automatic retry on failure."""
@@ -405,12 +430,15 @@ class MCPClient:
                     f"completed."
                 )
                 logger.error(message)
-                raise MRTRNotSupportedError(message) from e
+                raise MRTRNotSupportedError(message) from self._error_cause(e)
 
             logger.error(
-                f"Tool call failed for '{tool_name}' on '{self.server_name}': {e}"
+                f"Tool call failed for '{tool_name}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
             )
-            raise RuntimeError(f"Tool execution failed: {e}") from e
+            raise RuntimeError(
+                f"Tool execution failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def call_tool_with_retry(
         self, tool_name: str, arguments: dict[str, Any]
@@ -482,9 +510,12 @@ class MCPClient:
             self._circuit_breaker.record_failure()
             self._last_error = e
             logger.error(
-                f"Resource read failed for '{uri}' on '{self.server_name}': {e}"
+                f"Resource read failed for '{uri}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
             )
-            raise RuntimeError(f"Resource read failed: {e}") from e
+            raise RuntimeError(
+                f"Resource read failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def get_prompt(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -517,8 +548,13 @@ class MCPClient:
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
-            logger.error(f"Get prompt failed for '{name}' on '{self.server_name}': {e}")
-            raise RuntimeError(f"Get prompt failed: {e}") from e
+            logger.error(
+                f"Get prompt failed for '{name}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
+            )
+            raise RuntimeError(
+                f"Get prompt failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def set_logging_level(self, level: str) -> None:
         """Set the logging level for the MCP server.
@@ -559,7 +595,11 @@ class MCPClient:
             )
 
         except Exception as e:
-            logger.error(f"Failed to set logging level: {e}")
+            logger.error(f"Failed to set logging level: {self._error_detail(e)}")
+            if self.redact_connection_details:
+                raise RuntimeError(
+                    f"Failed to set logging level: {self._error_detail(e)}"
+                ) from None
             raise
 
     async def disconnect(self) -> None:
@@ -574,7 +614,9 @@ class MCPClient:
         try:
             await self._connection_task
         except Exception as e:
-            logger.warning(f"Error during {self.server_name} shutdown: {e}")
+            logger.warning(
+                f"Error during {self.server_name} shutdown: {self._error_detail(e)}"
+            )
         finally:
             self._connection_task = None
             logger.info(f"Disconnected from MCP server '{self.server_name}'")
