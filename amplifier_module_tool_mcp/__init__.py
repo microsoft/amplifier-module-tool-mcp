@@ -16,7 +16,7 @@ from amplifier_core import ModuleCoordinator
 
 from amplifier_module_tool_mcp.manager import MCPManager
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 __all__ = ["mount", "MCPManager"]
 
 logger = logging.getLogger(__name__)
@@ -35,48 +35,68 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Returns:
         Optional cleanup function
     """
+    ephemeral = coordinator.get_capability("mcp.ephemeral_servers")
+    coordinator.register_capability("mcp.ephemeral_servers", None)
+    coordinator.register_capability("mcp.ephemeral_ready", None)
     manager = MCPManager(config or {}, coordinator)
-    await manager.start()
+    mounted = {}
 
-    # Register all capabilities with the coordinator
-    capabilities = manager.get_all_capabilities()
+    async def cleanup():
+        coordinator.register_capability("mcp.ephemeral_ready", None)
+        try:
+            for name, wrapper in mounted.items():
+                if coordinator.get("tools", name) is wrapper:
+                    await coordinator.unmount("tools", name)
+        finally:
+            mounted.clear()
+            await manager.stop()
 
-    for cap_name, cap_wrapper in capabilities.items():
-        await coordinator.mount("tools", cap_wrapper, name=cap_name)
-        logger.debug(f"Mounted MCP capability: {cap_name}")
+    try:
+        await manager.start(ephemeral_servers=ephemeral)
+        # Register all capabilities with the coordinator
+        capabilities = manager.get_all_capabilities()
 
-    # Log summary
-    tools = manager.get_tools()
-    resources = manager.get_resources()
-    prompts = manager.get_prompts()
+        if capabilities.keys() & (coordinator.get("tools") or {}).keys():
+            raise ValueError("MCP capabilities conflict with mounted tools")
 
-    logger.info(
-        f"MCP module mounted: {len(tools)} tools, {len(resources)} resources, "
-        f"{len(prompts)} prompts from {len(manager.get_server_names())} servers"
-    )
+        for cap_name, cap_wrapper in capabilities.items():
+            mounted[cap_name] = cap_wrapper
+            await coordinator.mount("tools", cap_wrapper, name=cap_name)
+            logger.debug(f"Mounted MCP capability: {cap_name}")
 
-    # Mount MCP visibility hook if enabled AND servers exist
-    # Skip registration entirely when no servers - no point running a hook that does nothing
-    visibility_config = (config or {}).get("visibility", {})
-    server_names = manager.get_server_names()
-    if visibility_config.get("enabled", True) and server_names:
-        from amplifier_module_tool_mcp.hooks import MCPVisibilityHook
+        # Log summary
+        tools = manager.get_tools()
+        resources = manager.get_resources()
+        prompts = manager.get_prompts()
 
-        hook = MCPVisibilityHook(manager, visibility_config)
-
-        # Register hook on provider:request event
-        coordinator.hooks.register(
-            event="provider:request",
-            handler=hook.on_provider_request,
-            priority=hook.priority,
-            name="mcp-visibility",
+        logger.info(
+            f"MCP module mounted: {len(tools)} tools, {len(resources)} resources, "
+            f"{len(prompts)} prompts from {len(manager.get_server_names())} servers"
         )
 
-        logger.info(f"Mounted MCP visibility hook with {len(server_names)} servers")
+        # Mount MCP visibility hook if enabled AND servers exist
+        # Skip registration entirely when no servers - no point running a hook that does nothing
+        visibility_config = (config or {}).get("visibility", {})
+        server_names = manager.get_server_names()
+        if visibility_config.get("enabled", True) and server_names:
+            from amplifier_module_tool_mcp.hooks import MCPVisibilityHook
 
-    # Return cleanup function that properly shuts down connections
-    async def cleanup():
-        logger.info("Cleaning up MCP module...")
-        await manager.stop()
+            hook = MCPVisibilityHook(manager, visibility_config)
+
+            # Register hook on provider:request event
+            coordinator.hooks.register(
+                event="provider:request",
+                handler=hook.on_provider_request,
+                priority=hook.priority,
+                name="mcp-visibility",
+            )
+
+            logger.info(f"Mounted MCP visibility hook with {len(server_names)} servers")
+
+        if ephemeral is not None:
+            coordinator.register_capability("mcp.ephemeral_ready", sorted(ephemeral))
+    except BaseException:
+        await cleanup()
+        raise
 
     return cleanup

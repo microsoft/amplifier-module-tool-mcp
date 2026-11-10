@@ -60,6 +60,8 @@ class MCPStreamableHTTPClient:
         url: str,
         headers: dict[str, str] | None = None,
         reconnection_config: ReconnectionConfig | None = None,
+        *,
+        redact_connection_details: bool = False,
     ):
         """
         Initialize Streamable HTTP MCP client.
@@ -69,10 +71,12 @@ class MCPStreamableHTTPClient:
             url: HTTP endpoint URL
             headers: Optional HTTP headers
             reconnection_config: Reconnection configuration
+            redact_connection_details: Hide transient transport details in diagnostics
         """
         self.server_name = server_name
         self.url = url
         self.headers = headers or {}
+        self.redact_connection_details = redact_connection_details
         self.session: ClientSession | None = None
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
@@ -102,6 +106,7 @@ class MCPStreamableHTTPClient:
         self._circuit_breaker = CircuitBreaker()
         self._connection_attempts = 0
         self._last_error: Exception | None = None
+        self._retired = False
 
     @property
     def is_connected(self) -> bool:
@@ -119,15 +124,35 @@ class MCPStreamableHTTPClient:
         return {
             "server_name": self.server_name,
             "transport": "streamable-http",
-            "url": self.url,
+            "url": self._diagnostic_url,
             "is_connected": self.is_connected,
             "circuit_breaker_state": self._circuit_breaker.state,
             "connection_attempts": self._connection_attempts,
             "tools_discovered": len(self.tools),
             "resources_discovered": len(self.resources),
             "prompts_discovered": len(self.prompts),
-            "last_error": str(self._last_error) if self._last_error else None,
+            "last_error": (
+                self._error_detail(self._last_error) if self._last_error else None
+            ),
         }
+
+    @property
+    def _diagnostic_url(self) -> str:
+        return "[private endpoint]" if self.redact_connection_details else self.url
+
+    def _error_detail(self, error: BaseException) -> str:
+        return type(error).__name__ if self.redact_connection_details else str(error)
+
+    def _error_cause(self, error: BaseException) -> BaseException | None:
+        return None if self.redact_connection_details else error
+
+    def retire(self) -> None:
+        """Permanently refuse future use; the owner still joins disconnect()."""
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
@@ -207,7 +232,7 @@ class MCPStreamableHTTPClient:
 
                         logger.info(
                             f"Connected to Streamable HTTP MCP server '{self.server_name}' "
-                            f"at {self.url} (protocol {self._protocol_version or 'unknown'}) - "
+                            f"at {self._diagnostic_url} (protocol {self._protocol_version or 'unknown'}) - "
                             f"discovered {len(self.tools)} tools, "
                             f"{len(self.resources)} resources, {len(self.prompts)} prompts"
                         )
@@ -243,7 +268,7 @@ class MCPStreamableHTTPClient:
             else:
                 logger.error(
                     f"Failed to connect to Streamable HTTP MCP server "
-                    f"'{self.server_name}': {root_cause}"
+                    f"'{self.server_name}': {self._error_detail(root_cause)}"
                 )
 
         finally:
@@ -254,6 +279,7 @@ class MCPStreamableHTTPClient:
 
     async def connect(self) -> None:
         """Connect to Streamable HTTP MCP server (starts background task)."""
+        self._require_active()
         if self._connection_task is not None:
             return  # Already connected
 
@@ -279,26 +305,22 @@ class MCPStreamableHTTPClient:
             name=f"mcp-http-{self.server_name}",
         )
 
-        # Wait for ready signal with a hard timeout.
-        # asyncio.shield() keeps the background task alive even if the outer
-        # wait_for times out and raises TimeoutError here.
+        # The readiness waiter has no transport ownership and need not survive
+        # cancellation. The separate connection task must be cancelled/joined.
         try:
             await asyncio.wait_for(
-                asyncio.shield(self._ready_event.wait()),
+                self._ready_event.wait(),
                 timeout=CONNECTION_TIMEOUT,
             )
-        except asyncio.TimeoutError:
-            # Server accepted the connection but never completed the handshake.
-            # Cancel the background task so it doesn't linger.
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             self._connection_task.cancel()
-            try:
-                await self._connection_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await asyncio.gather(self._connection_task, return_exceptions=True)
             self._connection_task = None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise RuntimeError(
                 f"Streamable HTTP MCP server '{self.server_name}' did not respond "
-                f"within {CONNECTION_TIMEOUT:.0f}s (timed out connecting to {self.url})"
+                f"within {CONNECTION_TIMEOUT:.0f}s (timed out connecting to {self._diagnostic_url})"
             )
 
         # Check for startup errors
@@ -306,8 +328,10 @@ class MCPStreamableHTTPClient:
             await self._connection_task
             self._connection_task = None
             raise RuntimeError(
-                f"Streamable HTTP MCP server connection failed: {self._connection_error}"
+                "Streamable HTTP MCP server connection failed: "
+                f"{self._error_detail(self._connection_error)}"
             )
+        self._require_active()
 
     async def _discover_capabilities(self) -> None:
         """Discover tools, resources, and prompts from server.
@@ -330,6 +354,7 @@ class MCPStreamableHTTPClient:
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -377,15 +402,19 @@ class MCPStreamableHTTPClient:
                     f"completed."
                 )
                 logger.error(message)
-                raise MRTRNotSupportedError(message) from e
+                raise MRTRNotSupportedError(message) from self._error_cause(e)
 
             logger.error(
-                f"Tool call failed for '{tool_name}' on '{self.server_name}': {e}"
+                f"Tool call failed for '{tool_name}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
             )
-            raise RuntimeError(f"Tool execution failed: {e}") from e
+            raise RuntimeError(
+                f"Tool execution failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -414,14 +443,18 @@ class MCPStreamableHTTPClient:
             self._circuit_breaker.record_failure()
             self._last_error = e
             logger.error(
-                f"Resource read failed for '{uri}' on '{self.server_name}': {e}"
+                f"Resource read failed for '{uri}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
             )
-            raise RuntimeError(f"Resource read failed: {e}") from e
+            raise RuntimeError(
+                f"Resource read failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def get_prompt(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
         """Get a prompt from the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -449,8 +482,13 @@ class MCPStreamableHTTPClient:
         except Exception as e:
             self._circuit_breaker.record_failure()
             self._last_error = e
-            logger.error(f"Get prompt failed for '{name}' on '{self.server_name}': {e}")
-            raise RuntimeError(f"Get prompt failed: {e}") from e
+            logger.error(
+                f"Get prompt failed for '{name}' on '{self.server_name}': "
+                f"{self._error_detail(e)}"
+            )
+            raise RuntimeError(
+                f"Get prompt failed: {self._error_detail(e)}"
+            ) from self._error_cause(e)
 
     async def set_logging_level(self, level: str) -> None:
         """Set the logging level for the MCP server.
@@ -466,6 +504,7 @@ class MCPStreamableHTTPClient:
         construction) and this raises rather than silently no-op-ing or
         sending a method the server has every right to reject.
         """
+        self._require_active()
         if is_modern_protocol_version(self._protocol_version):
             self._log_level = level
             logger.info(
@@ -491,7 +530,11 @@ class MCPStreamableHTTPClient:
             )
 
         except Exception as e:
-            logger.error(f"Failed to set logging level: {e}")
+            logger.error(f"Failed to set logging level: {self._error_detail(e)}")
+            if self.redact_connection_details:
+                raise RuntimeError(
+                    f"Failed to set logging level: {self._error_detail(e)}"
+                ) from None
             raise
 
     async def disconnect(self) -> None:
@@ -506,7 +549,9 @@ class MCPStreamableHTTPClient:
         try:
             await self._connection_task
         except Exception as e:
-            logger.warning(f"Error during {self.server_name} shutdown: {e}")
+            logger.warning(
+                f"Error during {self.server_name} shutdown: {self._error_detail(e)}"
+            )
         finally:
             self._connection_task = None
             logger.info(

@@ -14,7 +14,41 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 - 📊 **Health monitoring** - Track server status and connection health
 - 🔇 **Clean console** - Server logs saved to files, not cluttering output
 
-**Version:** 0.2.2
+**Version:** 0.3.0
+
+## Temporary connections supplied by a host
+
+A trusted host can supply worker-lifetime connections without saving their
+credentials in a bundle or MCP configuration file. Before session initialization,
+register the coordinator capability `mcp.ephemeral_servers` with a mapping from
+server names to ordinary MCP server definitions (`type`, `url`, `headers` for
+HTTP, or `command`, `args`, `env` for stdio). This is a host API, not authority
+that project files, prompts or serialized provenance fields can grant themselves.
+The host still owns client authorization and must keep the mapping out of saved
+plans, session metadata and diagnostics.
+
+The selected bundle must include this module. Its one manager consumes the
+supplement during mount, alongside configured servers, and clears the input
+capability. Requested connections must all connect, discover and mount before
+`mcp.ephemeral_ready` contains their sorted names. The host must check that
+receipt before admitting model work; an absent/older module does not establish
+support. Existing configured servers retain their best-effort startup behavior.
+Conflicting server or final tool names are refused instead of replacing owners.
+
+Normal session cleanup disposes the connections; failed or cancelled startup
+rolls back its partial resources. Disposed manager-owned clients are retired so
+a retained tool handle cannot reopen them; standalone client disconnect/reconnect
+remains supported. Connection diagnostics for temporary servers
+omit transient connection details. Observer detachment is not session cleanup.
+There is no hot replacement API: a new attachment requiring another credential
+must use the host's existing worker retirement boundary. Source services retain
+their own membership, lease and revocation rules; this module adds no approval
+prompt or transcript store.
+
+This keeps descriptors and headers out of the module's saved configuration and
+generated transport diagnostics; it does not filter successful server content,
+structured server errors or independently emitted SDK/server logs. Hosts should
+pass credentials in headers or environment values, not in endpoint URLs.
 
 ## Protocol and SDK support
 
