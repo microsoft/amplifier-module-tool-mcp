@@ -14,7 +14,7 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 - 📊 **Health monitoring** - Track server status and connection health
 - 🔇 **Clean console** - Server logs saved to files, not cluttering output
 
-**Version:** 0.2.2
+**Version:** 0.3.0
 
 ## Temporary connections supplied by a host
 
