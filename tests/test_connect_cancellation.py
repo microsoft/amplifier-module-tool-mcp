@@ -11,6 +11,8 @@ import pytest
 
 from amplifier_module_tool_mcp import client as stdio
 from amplifier_module_tool_mcp import streamable_http_client as http
+from amplifier_module_tool_mcp.manager import MCPManager
+from amplifier_module_tool_mcp.wrapper import MCPToolWrapper
 
 
 def private_client(transport, redact):
@@ -231,3 +233,57 @@ async def test_http_timeout_hides_only_transient_endpoint(monkeypatch, redact):
     assert ("private-sentinel" in str(failure.value)) is not redact
     assert closed.is_set()
     assert client._connection_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+async def test_retained_wrapper_cannot_reopen_disposed_manager_client(monkeypatch, transport):
+    client = private_client(transport, True)
+    session = SimpleNamespace(call_tool=AsyncMock(return_value=SimpleNamespace(content=[])))
+    starts = []
+
+    async def connection():
+        starts.append(asyncio.current_task())
+        client.session = session
+        client._state = stdio.ConnectionState.CONNECTED
+        client._connected = True
+        client._ready_event.set()
+        try:
+            await client._shutdown_event.wait()
+        finally:
+            client.session = None
+            client._state = stdio.ConnectionState.DISCONNECTED
+            client._connected = False
+
+    monkeypatch.setattr(client, "_connection_task_impl", connection)
+    manager = MCPManager({}, SimpleNamespace(hooks=None))
+    wrapper = MCPToolWrapper("transient", {"name": "read"}, client, None)
+    manager.clients["transient"] = client
+    try:
+        await client.connect()
+        assert (await wrapper.execute({})).success
+        # Explicit disconnect remains reusable when its owner has not disposed it.
+        await client.disconnect()
+        await client.connect()
+        assert len(starts) == 2
+        await manager.stop()
+        result = await wrapper.execute({})
+        assert not result.success and "retired" in str(result.error)
+        for method, args in (
+            (client.connect, ()),
+            (client.read_resource, ("context://history",)),
+            (client.get_prompt, ("orientation",)),
+            (client.set_logging_level, ("info",)),
+        ):
+            with pytest.raises(RuntimeError, match="retired"):
+                await method(*args)
+        if transport == "stdio":
+            with pytest.raises(RuntimeError, match="retired"):
+                await client.connect_with_retry()
+            with pytest.raises(RuntimeError, match="retired"):
+                await client.call_tool_with_retry("read", {})
+        session.call_tool.assert_awaited_once()
+        assert len(starts) == 2
+        assert all(task.done() for task in starts)
+    finally:
+        await client.disconnect()

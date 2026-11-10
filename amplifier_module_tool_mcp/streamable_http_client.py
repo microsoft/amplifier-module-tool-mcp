@@ -106,6 +106,7 @@ class MCPStreamableHTTPClient:
         self._circuit_breaker = CircuitBreaker()
         self._connection_attempts = 0
         self._last_error: Exception | None = None
+        self._retired = False
 
     @property
     def is_connected(self) -> bool:
@@ -144,6 +145,14 @@ class MCPStreamableHTTPClient:
 
     def _error_cause(self, error: BaseException) -> BaseException | None:
         return None if self.redact_connection_details else error
+
+    def retire(self) -> None:
+        """Permanently refuse future use; the owner still joins disconnect()."""
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
@@ -270,6 +279,7 @@ class MCPStreamableHTTPClient:
 
     async def connect(self) -> None:
         """Connect to Streamable HTTP MCP server (starts background task)."""
+        self._require_active()
         if self._connection_task is not None:
             return  # Already connected
 
@@ -321,6 +331,7 @@ class MCPStreamableHTTPClient:
                 "Streamable HTTP MCP server connection failed: "
                 f"{self._error_detail(self._connection_error)}"
             )
+        self._require_active()
 
     async def _discover_capabilities(self) -> None:
         """Discover tools, resources, and prompts from server.
@@ -343,6 +354,7 @@ class MCPStreamableHTTPClient:
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -402,6 +414,7 @@ class MCPStreamableHTTPClient:
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -441,6 +454,7 @@ class MCPStreamableHTTPClient:
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
         """Get a prompt from the MCP server."""
+        self._require_active()
         if not self._connected or not self.session:
             await self.connect()
 
@@ -490,6 +504,7 @@ class MCPStreamableHTTPClient:
         construction) and this raises rather than silently no-op-ing or
         sending a method the server has every right to reject.
         """
+        self._require_active()
         if is_modern_protocol_version(self._protocol_version):
             self._log_level = level
             logger.info(

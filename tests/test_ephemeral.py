@@ -30,6 +30,7 @@ def clients(monkeypatch):
             self.args = args
             self.kwargs = kwargs
             self.disconnected = False
+            self.retired = False
             self.definitions = [{"name": "read", "input_schema": {}}]
             self.failure = None
             created.append(self)
@@ -40,6 +41,9 @@ def clients(monkeypatch):
 
         async def disconnect(self):
             self.disconnected = True
+
+        def retire(self):
+            self.retired = True
 
         def get_tools(self):
             return self.definitions
@@ -84,7 +88,7 @@ async def test_mount_uses_one_manager_without_persisting_supplement(clients, mon
     assert managers[0].config.inline_config == before == config
     assert [c.kwargs.get("redact_connection_details", False) for c in created] == [False, True]
     await cleanup()
-    assert all(c.disconnected for c in created)
+    assert all(c.disconnected and c.retired for c in created)
     assert not coordinator.get("tools")
     assert coordinator.get_capability("mcp.ephemeral_ready") is None
 

@@ -119,6 +119,7 @@ class MCPClient:
         self._circuit_breaker = CircuitBreaker()
         self._connection_attempts = 0
         self._last_error: Exception | None = None
+        self._retired = False
 
         # Server output control
         self.verbose_servers = verbose_servers
@@ -169,6 +170,14 @@ class MCPClient:
 
     def _error_cause(self, error: BaseException) -> BaseException | None:
         return None if self.redact_connection_details else error
+
+    def retire(self) -> None:
+        """Permanently refuse future use; the owner still joins disconnect()."""
+        self._retired = True
+
+    def _require_active(self) -> None:
+        if self._retired:
+            raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
@@ -311,6 +320,7 @@ class MCPClient:
 
     async def connect(self) -> None:
         """Connect to MCP server (starts background task)."""
+        self._require_active()
         if self._connection_task is not None:
             return  # Already connected
 
@@ -361,9 +371,11 @@ class MCPClient:
             raise RuntimeError(
                 f"MCP server connection failed: {detail}"
             ) from self._error_cause(root_cause)
+        self._require_active()
 
     async def connect_with_retry(self) -> None:
         """Connect with automatic retry on failure."""
+        self._require_active()
 
         async def _connect() -> None:
             await self.connect()
@@ -383,6 +395,7 @@ class MCPClient:
         Returns:
             Tool execution result
         """
+        self._require_active()
         if not self.is_connected or not self.session:
             await self.connect()
 
@@ -453,6 +466,7 @@ class MCPClient:
         Returns:
             Tool execution result
         """
+        self._require_active()
 
         async def _call() -> Any:
             return await self.call_tool(tool_name, arguments)
@@ -482,6 +496,7 @@ class MCPClient:
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource from the MCP server."""
+        self._require_active()
         if not self.is_connected or not self.session:
             await self.connect()
 
@@ -521,6 +536,7 @@ class MCPClient:
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
         """Get a prompt from the MCP server."""
+        self._require_active()
         if not self.is_connected or not self.session:
             await self.connect()
 
@@ -570,6 +586,7 @@ class MCPClient:
         construction) and this raises rather than silently no-op-ing or
         sending a method the server has every right to reject.
         """
+        self._require_active()
         if is_modern_protocol_version(self._protocol_version):
             self._log_level = level
             logger.info(

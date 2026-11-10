@@ -247,6 +247,7 @@ class MCPManager:
             await self._register_capabilities(server_name, client)
         except BaseException:
             try:
+                client.retire()
                 await client.disconnect()
             finally:
                 self.clients.pop(server_name, None)
@@ -304,6 +305,10 @@ class MCPManager:
     async def stop(self) -> None:
         """Stop all MCP servers cleanly."""
         logger.info("Stopping MCP manager...")
+
+        # A wrapper retained by a previous session must not reopen its transport.
+        for client in self.clients.values():
+            client.retire()
 
         # Disconnect all servers in parallel
         await asyncio.gather(

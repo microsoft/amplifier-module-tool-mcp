@@ -36,7 +36,9 @@ support. Existing configured servers retain their best-effort startup behavior.
 Conflicting server or final tool names are refused instead of replacing owners.
 
 Normal session cleanup disposes the connections; failed or cancelled startup
-rolls back its partial resources. Connection diagnostics for temporary servers
+rolls back its partial resources. Disposed manager-owned clients are retired so
+a retained tool handle cannot reopen them; standalone client disconnect/reconnect
+remains supported. Connection diagnostics for temporary servers
 omit transient connection details. Observer detachment is not session cleanup.
 There is no hot replacement API: a new attachment requiring another credential
 must use the host's existing worker retirement boundary. Source services retain
