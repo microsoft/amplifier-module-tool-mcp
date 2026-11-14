@@ -5,6 +5,7 @@ from typing import ClassVar
 
 import pytest
 from amplifier_core import ToolResult
+from mcp.types import CallToolResult
 
 from amplifier_module_tool_mcp.sdk_compat import MCPProtocolError
 from amplifier_module_tool_mcp.wrapper import MCPToolWrapper
@@ -197,3 +198,72 @@ async def test_wrapper_execute_surfaces_mcp_protocol_error(sample_tool_def, mock
     assert result.error["mcp_error_code"] == -32021
     assert result.error["mcp_error_data"] == {"requiredCapabilities": ["elicitation"]}
     assert "MissingRequiredClientCapability" in result.error["mcp_error_explanation"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wire_result", "success", "text", "structured"),
+    [
+        ({"content": []}, True, "", None),
+        (
+            {
+                "content": [{"type": "text", "text": "Created work"}],
+                "isError": False,
+                "structuredContent": {"id": "work-1"},
+            },
+            True,
+            "Created work",
+            {"id": "work-1"},
+        ),
+        ({"content": [], "isError": True}, False, "", None),
+        (
+            {
+                "content": [{"type": "text", "text": "Invalid source_input_id"}],
+                "isError": True,
+                "structuredContent": {"reason": "unknown_source"},
+            },
+            False,
+            "Invalid source_input_id",
+            {"reason": "unknown_source"},
+        ),
+    ],
+    ids=["default-success", "structured-success", "empty-error", "structured-error"],
+)
+async def test_wrapper_preserves_sdk_tool_result_status(
+    sample_tool_def, mock_hooks, wire_result, success, text, structured
+):
+    """A valid MCP tool refusal is not success or a JSON-RPC/transport error.
+
+    Parse the protocol envelope through the actual installed SDK. This covers
+    its real default and field aliases on both supported SDK major versions.
+    """
+    sdk_result = CallToolResult.model_validate(wire_result)
+
+    class ResultClient:
+        calls = 0
+
+        async def call_tool(self, name, arguments):
+            self.calls += 1
+            return sdk_result
+
+    client = ResultClient()
+    wrapper = MCPToolWrapper("test-server", sample_tool_def, client, mock_hooks)
+    result = await wrapper.execute({"input": "test"})
+
+    assert result.success is success
+    assert result.output["content"] == text
+    assert result.output["structured_content"] == structured
+    assert result.output["mcp_server"] == "test-server"
+    assert result.output["mcp_tool"] == "test_tool"
+    assert result.output["content_size_chars"] == len(text)
+    assert result.output["content_truncated"] is False
+    assert client.calls == 1
+    if success:
+        assert result.error is None
+    else:
+        assert result.error["mcp_is_error"] is True
+        assert result.error["message"]
+        assert result.error["mcp_server"] == "test-server"
+        assert result.error["mcp_tool"] == "test_tool"
+        assert "mcp_error_code" not in result.error
+        assert "mcp_error_data" not in result.error
