@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-tool-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP (Model Context Protocol) tool module for Amplifier"
 license = "MIT"
 readme = "README.md"
