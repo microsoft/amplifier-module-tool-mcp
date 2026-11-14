@@ -100,11 +100,16 @@ class MCPToolWrapper:
             structured_content = sdk_field(
                 result, "structured_content", "structuredContent", default=None
             )
+            # Tool execution failure is a valid MCP result, distinct from a
+            # JSON-RPC error or failed transport. isError is optional on wire.
+            is_error = sdk_field(result, "is_error", "isError", default=False)
+            if type(is_error) is not bool:
+                raise ValueError("Unsupported MCP isError shape: expected boolean")
 
             # ToolResult.output must be a dict, not a string
             # Include MCP metadata for better log viewer experience
             return ToolResult(
-                success=True,
+                success=not is_error,
                 output={
                     "content": content,
                     "mcp_server": self.server_name,
@@ -113,6 +118,14 @@ class MCPToolWrapper:
                     "content_truncated": was_truncated,
                     "structured_content": structured_content,
                 },
+                error={
+                    "message": "MCP server returned isError; inspect output evidence",
+                    "mcp_is_error": True,
+                    "mcp_server": self.server_name,
+                    "mcp_tool": self.tool_name,
+                }
+                if is_error
+                else None,
             )
 
         except MCPProtocolError as e:
