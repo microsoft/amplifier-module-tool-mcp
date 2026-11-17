@@ -248,7 +248,7 @@ class HTTPApprovalGuard:
         call.request_ids.add(request_id)
         self.pending[request_id] = [call, expected, False]
 
-    def _entry(self, request):
+    def _entry(self, request, *, tagged_only=False):
         tagged = request.extensions.get(_REQUEST_APPROVAL)
         if tagged is not None:
             # HTTPX preserves extensions when constructing redirect requests,
@@ -264,6 +264,10 @@ class HTTPApprovalGuard:
                 )
             self._check(tagged[0])
             return tagged
+        if tagged_only:
+            # Auth flows can yield unrelated form/opaque HTTP requests. They
+            # have no MCP invocation tag and retain ordinary SDK behavior.
+            return
         if request.method != "POST":
             return
         payload = json.loads(request.content)
@@ -291,7 +295,7 @@ class HTTPApprovalGuard:
     async def before_send(self, request):
         # HTTPX calls request hooks after auth, on each actual send. There is no
         # await between this check and returning to its transport dispatch.
-        entry = self._entry(request)
+        entry = self._entry(request, tagged_only=True)
         if entry is None:
             return
         call, expected, sent = entry
@@ -327,8 +331,12 @@ class AuthorizedHTTPClient:
     async def send(self, request, **kwargs):
         # SDK redirects may wrap the already-buffered JSON body in a stream.
         # Materialize that body before the checks; no authority is consumed yet.
+        request_id = None
         if request.method == "POST":
             await request.aread()
+            payload = json.loads(request.content)
+            if isinstance(payload, dict):
+                request_id = payload.get("id")
         try:
             entry = self.guard.before_auth(request)
             if (
@@ -344,7 +352,10 @@ class AuthorizedHTTPClient:
             # A local refusal belongs to this RPC, not every waiter sharing the
             # connection. It neither sends nor retries the refused request. A
             # prior sent request (e.g. a redirect response) remains historical.
-            payload = json.loads(request.content)
+            # Keep the original RPC correlation even if the refused request's
+            # body was changed after construction. This ID grants no authority.
+            if type(request_id) not in (int, str):
+                raise
             module = type(self.client).__module__.split(".")[0]
             if module not in ("httpx", "httpx2"):
                 raise
@@ -354,7 +365,7 @@ class AuthorizedHTTPClient:
                 request=request,
                 json={
                     "jsonrpc": "2.0",
-                    "id": payload["id"],
+                    "id": request_id,
                     "error": {
                         "code": -32000,
                         "message": "HTTP approval refused before this send.",

@@ -30,10 +30,15 @@ def rpc_method(ctx):
 @pytest_asyncio.fixture(params=["legacy", "modern"] if SDK_MAJOR >= 2 else ["legacy"])
 async def connected(monkeypatch, request):
     effects = []
-    state = SimpleNamespace(redirect=False, redirect_status=307, unexpected_gets=[])
+    state = SimpleNamespace(
+        redirect=False, redirect_status=307, unexpected_gets=[], auth_posts=[]
+    )
     modern = request.param == "modern"
 
     async def peer(request):
+        if request.url.path == "/oauth/token":
+            state.auth_posts.append(request.content)
+            return httpx.Response(200, json={"access_token": "finite-auth-result"})
         if request.method != "POST":
             state.unexpected_gets.append(str(request.url))
             return httpx.Response(405)
@@ -362,3 +367,57 @@ async def test_redirect_cannot_discard_approval_by_replacing_post_with_get(conne
             await c.call_tool("write", {"value": 1})
     assert connected.effects == []
     assert connected.state.unexpected_gets == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"grant_type=client_credentials", b"\x00\xffopaque"])
+async def test_ordinary_custom_auth_can_send_opaque_post(connected, body):
+    class TokenAuth(httpx.Auth):
+        async def async_auth_flow(self, request):
+            token_request = httpx.Request(
+                "POST",
+                "http://fixture.test/oauth/token",
+                content=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = yield token_request
+            await response.aread()
+            request.headers["Authorization"] = (
+                "Bearer " + response.json()["access_token"]
+            )
+            yield request
+
+    c = connected.client
+    connected.http.auth = TokenAuth()
+    with pytest.raises(ValueError, match="authorization pipeline is unsupported"):
+        c.approval_binding()
+    await asyncio.wait_for(c.call_tool("write", {"value": 1}), 3)
+    assert connected.state.auth_posts == [body]
+    assert len(connected.effects) == 1
+    assert (
+        connected.effects[0]["headers"]["authorization"] == "Bearer finite-auth-result"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"opaque", b"\x00\xffopaque"])
+async def test_tagged_approved_request_cannot_become_opaque(
+    connected, monkeypatch, body
+):
+    c, http = connected.client, connected.http
+    original = http.send
+
+    async def changed(request, **kwargs):
+        request._content = body
+        request.stream = httpx.ByteStream(body)
+        request.headers["content-length"] = str(len(body))
+        return await original(request, **kwargs)
+
+    monkeypatch.setattr(http, "send", changed)
+    with c.approval_scope(c.approval_binding(), "write", {"value": 1}):
+        with pytest.raises(
+            MCPProtocolError, match="HTTP approval refused before this send"
+        ):
+            await asyncio.wait_for(c.call_tool("write", {"value": 1}), 3)
+    assert connected.effects == []
+    assert connected.state.auth_posts == []
