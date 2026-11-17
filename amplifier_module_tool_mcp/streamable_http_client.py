@@ -8,10 +8,7 @@ module does not pin or assume a specific spec version.
 import asyncio
 import logging
 from contextlib import nullcontext
-from typing import Any
-
-from .approval_binding import bind, check
-from .http_approval import ApprovalSendStream, HTTPApprovalGuard
+from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -40,6 +37,15 @@ from amplifier_module_tool_mcp.sdk_compat import (
     supports_log_level_kwarg,
 )
 
+from .approval_binding import bind, check
+from .client_options import (
+    configuration_options,
+    require_same_session,
+    session_timeout_kwargs,
+    validate_options,
+)
+from .http_approval import ApprovalSendStream, HTTPApprovalGuard
+
 logger = logging.getLogger(__name__)
 
 # Hard timeout (seconds) for the initial MCP handshake.
@@ -66,6 +72,8 @@ class MCPStreamableHTTPClient:
         reconnection_config: ReconnectionConfig | None = None,
         *,
         redact_connection_details: bool = False,
+        discovery: Literal["all", "tools"] = "all",
+        read_timeout_seconds: float | None = None,
     ):
         """
         Initialize Streamable HTTP MCP client.
@@ -76,7 +84,12 @@ class MCPStreamableHTTPClient:
             headers: Optional HTTP headers
             reconnection_config: Reconnection configuration
             redact_connection_details: Hide transient transport details in diagnostics
+            discovery: Discover all capabilities (default), or only paginated tools
+            read_timeout_seconds: Optional positive SDK session read timeout
         """
+        validate_options(discovery, read_timeout_seconds)
+        self.discovery = discovery
+        self.read_timeout_seconds = read_timeout_seconds
         self.server_name = server_name
         self.url = url
         self.headers = headers or {}
@@ -114,15 +127,19 @@ class MCPStreamableHTTPClient:
         self._approval_http = None
 
     def _approval_configuration(self):
-        return {"server": self.server_name, "url": self.url, "headers": self.headers}
+        configuration = {"server": self.server_name, "url": self.url, "headers": self.headers}
+        options = configuration_options(self.discovery, self.read_timeout_seconds)
+        if options:
+            configuration["client_options"] = options
+        return configuration
 
     def approval_binding(self):
         if self._approval_http is None:
             raise ValueError("The HTTP connection has no send authorization guard")
         return self._approval_http.describe()
 
-    def approval_scope(self, expected, tool_name, arguments):
-        return bind(self, expected, tool_name, arguments)
+    def approval_scope(self, expected, tool_name, arguments, *, is_current=None):
+        return bind(self, expected, tool_name, arguments, is_current=is_current)
 
     @property
     def is_connected(self) -> bool:
@@ -226,7 +243,8 @@ class MCPStreamableHTTPClient:
                     # only when supported and a level has been requested via
                     # a prior set_logging_level() call.
                     session_kwargs: dict[str, Any] = {
-                        "client_info": build_client_info()
+                        "client_info": build_client_info(),
+                        **session_timeout_kwargs(self.read_timeout_seconds),
                     }
                     if self._log_level is not None and supports_log_level_kwarg():
                         session_kwargs["log_level"] = self._log_level
@@ -365,6 +383,9 @@ class MCPStreamableHTTPClient:
             return
 
         self.tools = await discover_tools(self.session)
+        if self.discovery == "tools":
+            self.resources, self.prompts = [], []
+            return
         self.resources = await discover_resources(
             self.session, server_name=self.server_name
         )
@@ -372,14 +393,23 @@ class MCPStreamableHTTPClient:
             self.session, server_name=self.server_name
         )
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool on the MCP server."""
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any], *, reconnect: bool = True
+    ) -> Any:
+        """Call a tool; reconnect=False admits only the current connected session."""
         self._require_active()
+        if type(reconnect) is not bool:
+            raise ValueError("MCP reconnect must be a boolean")
+        session = self.session
         check(self, tool_name, arguments)
-        if not self._connected or not self.session:
+        if not reconnect:
+            require_same_session(self, session)
+        elif not self._connected or not self.session:
             await self.connect()
 
         approval = check(self, tool_name, arguments, consume=True)
+        if not reconnect:
+            require_same_session(self, session)
         scope = (self._approval_http.call(tool_name, arguments, approval)
                  if self._approval_http is not None else nullcontext())
         try:
