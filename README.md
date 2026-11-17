@@ -18,18 +18,27 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 
 ## Optional host approval binding
 
-A host that already owns permission decisions can use a connected stdio client's
+A host that already owns permission decisions can use a connected client's
 `approval_binding()` and `approval_scope(binding, tool_name, arguments)` around
 one `call_tool`. The opaque binding describes the actual opened connection,
 negotiated protocol and effective configuration, including inherited process
-environment and working directory. It contains no credential values. Clients
+environment and working directory for stdio. It contains no credential values. Clients
 without captured connection evidence refuse this optional binding while
 retaining ordinary calls.
 
-HTTP clients do not expose this API. Their SDK queues requests, so current
-headers, cookies or authentication can change before the actual HTTP send.
-Hosts must keep HTTP requests Once-only until that boundary is enforced; a
-configuration fingerprint before SDK invocation is insufficient.
+Streamable HTTP bindings additionally advertise `httpSendAuthorization: 1`.
+The client binds effective headers and cookies, the endpoint, protocol and SDK
+parameter-header mappings. It tracks the exact queued RPC and checks its complete
+constructed request immediately before transport dispatch. A queued request cannot
+silently acquire changed authorization from another response or a new auth flow.
+Cancellation retires that RPC's authority. A refusal is correlated to that call;
+it does not cancel unrelated calls on the connection.
+
+Custom HTTP auth flows and URL credentials do not offer this optional binding.
+An approved call cannot follow a redirect or resend: a new request needs a new
+approval decision. Refusing a later send does not undo a request already sent.
+Ordinary unbound calls retain the SDK's auth and redirect behavior. Hosts must
+keep older HTTP clients without the send-authorization capability Once-only.
 
 The scope checks the exact session and request before reconnect and immediately
 before SDK invocation, allows one invocation, and expires on exit even in inherited

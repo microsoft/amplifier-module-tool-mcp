@@ -91,3 +91,4 @@ def check(client, tool_name, arguments, *, consume=False):
         raise ValueError("The approved MCP connection changed before invocation")
     if consume:
         expected.consumed = True
+    return expected

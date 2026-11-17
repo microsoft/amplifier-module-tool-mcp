@@ -7,7 +7,11 @@ module does not pin or assume a specific spec version.
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from typing import Any
+
+from .approval_binding import bind, check
+from .http_approval import ApprovalSendStream, HTTPApprovalGuard
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -107,6 +111,18 @@ class MCPStreamableHTTPClient:
         self._connection_attempts = 0
         self._last_error: Exception | None = None
         self._retired = False
+        self._approval_http = None
+
+    def _approval_configuration(self):
+        return {"server": self.server_name, "url": self.url, "headers": self.headers}
+
+    def approval_binding(self):
+        if self._approval_http is None:
+            raise ValueError("The HTTP connection has no send authorization guard")
+        return self._approval_http.describe()
+
+    def approval_scope(self, expected, tool_name, arguments):
+        return bind(self, expected, tool_name, arguments)
 
     @property
     def is_connected(self) -> bool:
@@ -181,8 +197,10 @@ class MCPStreamableHTTPClient:
             async with create_mcp_http_client(
                 headers=self.headers if self.headers else None
             ) as http_client:
+                guard = HTTPApprovalGuard(self, http_client)
+                self._approval_http = guard
                 async with streamable_http_client(
-                    self.url, http_client=http_client
+                    self.url, http_client=guard.transport
                 ) as conn:
                     # Tolerate 2-tuple or 3-tuple unpacking.  The MCP SDK has
                     # historically returned ``(read, write)`` and now returns
@@ -213,7 +231,7 @@ class MCPStreamableHTTPClient:
                     if self._log_level is not None and supports_log_level_kwarg():
                         session_kwargs["log_level"] = self._log_level
 
-                    async with ClientSession(read, write, **session_kwargs) as session:
+                    async with ClientSession(read, ApprovalSendStream(write, guard), **session_kwargs) as session:
                         # Negotiate protocol version. On mcp>=2.0 this drives
                         # the full modern stateless handshake (server/discover
                         # + automatic legacy fallback); on mcp<2.0 (no
@@ -224,6 +242,7 @@ class MCPStreamableHTTPClient:
                         )
 
                         self.session = session
+                        guard.session = session
                         await self._discover_capabilities()
                         self._connected = True
                         self._circuit_breaker.record_success()
@@ -274,6 +293,7 @@ class MCPStreamableHTTPClient:
         finally:
             # Clear state
             self.session = None
+            self._approval_http = None
             self._connected = False
             logger.debug(f"Connection task for '{self.server_name}' completed")
 
@@ -355,11 +375,16 @@ class MCPStreamableHTTPClient:
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
         self._require_active()
+        check(self, tool_name, arguments)
         if not self._connected or not self.session:
             await self.connect()
 
+        approval = check(self, tool_name, arguments, consume=True)
+        scope = (self._approval_http.call(tool_name, arguments, approval)
+                 if self._approval_http is not None else nullcontext())
         try:
-            result = await self.session.call_tool(tool_name, arguments=arguments)
+            with scope:
+                result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()
             return result
 

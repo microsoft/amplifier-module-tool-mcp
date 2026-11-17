@@ -55,7 +55,9 @@ async def test_cancel_stalled_handshake_joins_transport_cleanup(monkeypatch, tra
     @asynccontextmanager
     async def session(*args, **kwargs):
         try:
-            yield object()
+            # This context also stands in for the private HTTP client. Retain
+            # its real request-hook surface while the handshake stays stalled.
+            yield SimpleNamespace(event_hooks={"request": []})
         finally:
             await asyncio.sleep(0)
             cleaned.append("session")
