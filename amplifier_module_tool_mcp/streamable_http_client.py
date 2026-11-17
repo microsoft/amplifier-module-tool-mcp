@@ -6,8 +6,11 @@ module does not pin or assume a specific spec version.
 """
 
 import asyncio
+import copy
 import logging
+import os
 from typing import Any
+from .approval_binding import ConnectionBinding, bind, check, http_state
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -78,6 +81,7 @@ class MCPStreamableHTTPClient:
         self.headers = headers or {}
         self.redact_connection_details = redact_connection_details
         self.session: ClientSession | None = None
+        self._approval_connection: ConnectionBinding | None = None
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
         self.prompts: list[dict[str, Any]] = []
@@ -154,6 +158,17 @@ class MCPStreamableHTTPClient:
         if self._retired:
             raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
+    def _approval_configuration(self):
+        return {"server": self.server_name, "url": self.url, "headers": self.headers}
+
+    def approval_binding(self):
+        if self._approval_connection is None:
+            raise ValueError("The MCP connection has no captured approval binding")
+        return self._approval_connection.describe(self._approval_configuration())
+
+    def approval_scope(self, expected, tool_name, arguments):
+        return bind(self, expected, tool_name, arguments)
+
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
 
@@ -175,14 +190,18 @@ class MCPStreamableHTTPClient:
           message that previously appeared in logs.
         """
         try:
+            configuration = copy.deepcopy(self._approval_configuration())
+            connection_url = self.url
+            connection_headers = dict(self.headers)
+            environment = dict(os.environ)
             # Use the current (non-deprecated) streamable_http_client API.
             # create_mcp_http_client applies MCP-recommended timeouts and
             # follow_redirects=True; custom headers are passed in here.
             async with create_mcp_http_client(
-                headers=self.headers if self.headers else None
+                headers=connection_headers or None
             ) as http_client:
                 async with streamable_http_client(
-                    self.url, http_client=http_client
+                    connection_url, http_client=http_client
                 ) as conn:
                     # Tolerate 2-tuple or 3-tuple unpacking.  The MCP SDK has
                     # historically returned ``(read, write)`` and now returns
@@ -226,6 +245,11 @@ class MCPStreamableHTTPClient:
                         self.session = session
                         await self._discover_capabilities()
                         self._connected = True
+                        self._approval_connection = ConnectionBinding(self, session, configuration, {
+                            "transport": "streamable-http", "server": self.server_name,
+                            "url": connection_url, "headers": connection_headers,
+                            "environment": environment, "protocol": self._protocol_version,
+                        }, current_transport=lambda: http_state(http_client))
                         self._circuit_breaker.record_success()
                         self._last_error = None
                         self._ready_event.set()
@@ -274,6 +298,7 @@ class MCPStreamableHTTPClient:
         finally:
             # Clear state
             self.session = None
+            self._approval_connection = None
             self._connected = False
             logger.debug(f"Connection task for '{self.server_name}' completed")
 
@@ -355,9 +380,11 @@ class MCPStreamableHTTPClient:
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
         self._require_active()
+        check(self, tool_name, arguments)
         if not self._connected or not self.session:
             await self.connect()
 
+        check(self, tool_name, arguments, consume=True)
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()

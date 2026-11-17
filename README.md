@@ -16,6 +16,23 @@ This module enables Amplifier to connect to MCP servers and expose their capabil
 
 **Version:** 0.3.1
 
+## Optional host approval binding
+
+A host that already owns permission decisions can use a connected client's
+`approval_binding()` and `approval_scope(binding, tool_name, arguments)` around
+one `call_tool`. The opaque binding describes the actual opened connection,
+negotiated protocol and effective configuration, including inherited stdio
+environment or HTTP headers/cookies. It contains no credential values. Clients
+without captured connection evidence, or with unsupported custom HTTP auth,
+refuse this optional binding while retaining ordinary calls.
+
+The scope checks the exact session and request before reconnect and immediately
+before sending, allows one invocation, and expires on exit even in inherited
+task contexts. A reconnect cannot complete an earlier permission request; a new
+request may match a host-owned rule if the connection facts are equal. No rules,
+automatic permission decisions, retries or persistent approval state are added
+here. Remote identity and behavior are not attested by a configured connection.
+
 ## Temporary connections supplied by a host
 
 A trusted host can supply worker-lifetime connections without saving their

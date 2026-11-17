@@ -1,13 +1,16 @@
 """MCP Client wrapper for connecting to and communicating with MCP servers."""
 
 import asyncio
+import copy
 import logging
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from .approval_binding import ConnectionBinding, bind, check
 
 from amplifier_module_tool_mcp.discovery import (
     discover_prompts,
@@ -92,6 +95,7 @@ class MCPClient:
         self.env = env or {}
         self.redact_connection_details = redact_connection_details
         self.session: ClientSession | None = None
+        self._approval_connection: ConnectionBinding | None = None
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
         self.prompts: list[dict[str, Any]] = []
@@ -179,6 +183,18 @@ class MCPClient:
         if self._retired:
             raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
+    def _approval_configuration(self):
+        return {"server": self.server_name, "command": self.command,
+                "arguments": self.args, "environment": self.env}
+
+    def approval_binding(self):
+        if self._approval_connection is None:
+            raise ValueError("The MCP connection has no captured approval binding")
+        return self._approval_connection.describe(self._approval_configuration())
+
+    def approval_scope(self, expected, tool_name, arguments):
+        return bind(self, expected, tool_name, arguments)
+
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
 
@@ -187,8 +203,7 @@ class MCPClient:
         """
         try:
             # Create server parameters with inherited environment
-            import os
-
+            configuration = copy.deepcopy(self._approval_configuration())
             if self.env:
                 # Inherit all parent env vars, then override with server config
                 merged_env = {**os.environ, **self.env}
@@ -200,6 +215,7 @@ class MCPClient:
                 command=self.command,
                 args=self.args,
                 env=merged_env,
+                cwd=os.getcwd(),
             )
 
             # Open log file if needed
@@ -249,6 +265,12 @@ class MCPClient:
                         self.session = session
                         await self._discover_capabilities()
                         self._state = ConnectionState.CONNECTED
+                        self._approval_connection = ConnectionBinding(self, session, configuration, {
+                            "transport": "stdio", "server": self.server_name,
+                            "command": server_params.command, "arguments": server_params.args,
+                            "environment": server_params.env, "cwd": server_params.cwd,
+                            "protocol": self._protocol_version,
+                        })
                         self._circuit_breaker.record_success()
                         self._last_error = None
                         self._ready_event.set()
@@ -315,6 +337,7 @@ class MCPClient:
         finally:
             # Clear state
             self.session = None
+            self._approval_connection = None
             self._state = ConnectionState.DISCONNECTED
             logger.debug(f"Connection task for '{self.server_name}' completed")
 
@@ -396,9 +419,11 @@ class MCPClient:
             Tool execution result
         """
         self._require_active()
+        check(self, tool_name, arguments)
         if not self.is_connected or not self.session:
             await self.connect()
 
+        check(self, tool_name, arguments, consume=True)
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()
