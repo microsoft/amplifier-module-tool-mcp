@@ -7,15 +7,15 @@ survives the SDK's task boundary, but never the original call's cancellation.
 There is no durable policy or automatic retry here.
 """
 
+import importlib
+import json
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-import importlib
-import json
+
 from pydantic import RootModel
 
-from .approval_binding import digest, request_digest
-
+from .approval_binding import digest, request_digest, require_current
 
 _CALL = ContextVar("mcp_http_approval_call", default=None)
 _REQUEST_APPROVAL = "amplifier.mcp.approval_send"
@@ -145,6 +145,11 @@ class HTTPApprovalGuard:
             _CALL.reset(token)
 
     def _check(self, call):
+        if call.approval is not None:
+            try:
+                require_current(call.approval)
+            except ValueError:
+                raise HTTPApprovalRefused("The HTTP invocation owner is no longer current") from None
         if (
             not call.active
             or call.guard is not self

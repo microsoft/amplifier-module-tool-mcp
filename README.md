@@ -47,6 +47,60 @@ request may match a host-owned rule if the connection facts are equal. No rules,
 automatic permission decisions, retries or persistent approval state are added
 here. Remote identity and behavior are not attested by a configured connection.
 
+A host may supply `approval_scope(..., is_current=predicate)` as an additional
+per-invocation veto. The synchronous, nonblocking, side-effect-free predicate
+must return exactly `True`; any other result or exception refuses admission.
+That refusal expires the invocation; a later `True` cannot revive its scope.
+It is checked on scope entry, before SDK invocation, and for HTTP at queue
+registration, before authentication, and at the final checked send. This lets a
+host revoke an outstanding request when its turn or recovery gate changes even
+before cancellation unwinds the task. It cannot override any connection, request,
+auth, cancellation, redirect or resend check. Its value is never stored as a rule
+or incorporated into a reusable key. Omitting it retains existing behavior.
+
+For stdio, the guarantee ends at SDK invocation admission: this client cannot
+retract bytes already accepted into the SDK's pipe queue. HTTP final-send checks
+apply to scoped requests; unscoped calls and custom auth do not gain that
+attestation. A refusal after an earlier send never proves that earlier request
+had no effect.
+
+## Host-controlled client settings
+
+The two public clients accept these optional keyword-only constructor arguments:
+
+- `discovery="all"`: discover tools, resources and prompts as before. `"tools"`
+  retains paginated tool discovery and leaves resources/prompts empty without
+  requesting those capabilities.
+- `read_timeout_seconds=None`: omit the session timeout override, preserving SDK
+  defaults. A positive finite number sets the public SDK session read timeout
+  (seconds on SDK 2.x, converted to `timedelta` on supported SDK 1.x). It does not
+  renew a deadline or add retries; the HTTP connection handshake remains bounded
+  by the existing 30-second limit.
+
+`MCPClient` (stdio) additionally accepts:
+
+- `cwd=None`: use the process working directory at connection time, as before.
+  An explicit absolute path is copied at construction and passed to the child.
+- `inherit_environment=True`: merge the parent environment at connection time
+  with the supplied `env`, as before. `False` copies `env` at construction and
+  suppresses inherited parent values. Because the SDK overlays its own public
+  default environment, unspecified `DEFAULT_INHERITED_ENV_VARS` are passed as
+  empty strings, not omitted. Explicit values override those blanks. Neither
+  mode changes the host process environment or working directory.
+
+Both clients also accept `call_tool(name, arguments, reconnect=False)`. This
+requires the currently connected session to remain identical through SDK
+admission and refuses with `ValueError` before invocation if it is missing or
+changed. It never reconnects. The default `reconnect=True` retains the existing
+behavior. This option applies to ordinary calls too; it adds no persistent
+permission or unscoped HTTP final-send guarantee. Raw SDK results and existing
+structured `MCPProtocolError` mapping are unchanged.
+
+Nondefault client settings participate in connection binding checks. Default
+settings preserve existing binding keys. Hosts must require a module release
+that exposes these APIs before using them; an unsupported keyword or unverifiable
+binding cannot be treated as reusable approval support.
+
 ## Temporary connections supplied by a host
 
 A trusted host can supply worker-lifetime connections without saving their

@@ -6,11 +6,10 @@ import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from .approval_binding import ConnectionBinding, bind, check
+from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS, stdio_client
 
 from amplifier_module_tool_mcp.discovery import (
     discover_prompts,
@@ -33,6 +32,14 @@ from amplifier_module_tool_mcp.sdk_compat import (
     is_mrtr_unsupported_error,
     negotiate,
     supports_log_level_kwarg,
+)
+
+from .approval_binding import ConnectionBinding, bind, check
+from .client_options import (
+    configuration_options,
+    require_same_session,
+    session_timeout_kwargs,
+    validate_options,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +82,10 @@ class MCPClient:
         server_log_dir: Path | None = None,
         *,
         redact_connection_details: bool = False,
+        cwd: str | Path | None = None,
+        inherit_environment: bool = True,
+        discovery: Literal["all", "tools"] = "all",
+        read_timeout_seconds: float | None = None,
     ):
         """
         Initialize MCP client.
@@ -88,11 +99,24 @@ class MCPClient:
             verbose_servers: Whether to show server stderr output (default: False)
             server_log_dir: Directory for server logs when suppressed (default: ~/.amplifier/logs/mcp-servers/)
             redact_connection_details: Hide transient transport details in diagnostics
+            cwd: Optional absolute child working directory, copied at construction
+            inherit_environment: Merge parent values; False blanks SDK default values
+            discovery: Discover all capabilities (default), or only paginated tools
+            read_timeout_seconds: Optional positive SDK session read timeout
         """
+        validate_options(discovery, read_timeout_seconds)
+        if type(inherit_environment) is not bool:
+            raise ValueError("MCP inherit_environment must be a boolean")
+        if cwd is not None and not Path(cwd).is_absolute():
+            raise ValueError("MCP cwd must be an absolute path")
+        self.cwd = str(cwd) if cwd is not None else None
+        self.inherit_environment = inherit_environment
+        self.discovery = discovery
+        self.read_timeout_seconds = read_timeout_seconds
         self.server_name = server_name
         self.command = command
         self.args = args
-        self.env = env or {}
+        self.env = (env or {}) if inherit_environment else dict(env or {})
         self.redact_connection_details = redact_connection_details
         self.session: ClientSession | None = None
         self._approval_connection: ConnectionBinding | None = None
@@ -184,16 +208,24 @@ class MCPClient:
             raise RuntimeError(f"MCP connection '{self.server_name}' has been retired")
 
     def _approval_configuration(self):
-        return {"server": self.server_name, "command": self.command,
-                "arguments": self.args, "environment": self.env}
+        configuration = {"server": self.server_name, "command": self.command,
+                         "arguments": self.args, "environment": self.env}
+        options = configuration_options(self.discovery, self.read_timeout_seconds)
+        if self.cwd is not None:
+            options["cwd"] = self.cwd
+        if not self.inherit_environment:
+            options["inherit_environment"] = False
+        if options:
+            configuration["client_options"] = options
+        return configuration
 
     def approval_binding(self):
         if self._approval_connection is None:
             raise ValueError("The MCP connection has no captured approval binding")
         return self._approval_connection.describe(self._approval_configuration())
 
-    def approval_scope(self, expected, tool_name, arguments):
-        return bind(self, expected, tool_name, arguments)
+    def approval_scope(self, expected, tool_name, arguments, *, is_current=None):
+        return bind(self, expected, tool_name, arguments, is_current=is_current)
 
     async def _connection_task_impl(self) -> None:
         """Background task that owns the connection lifecycle.
@@ -204,7 +236,11 @@ class MCPClient:
         try:
             # Create server parameters with inherited environment
             configuration = copy.deepcopy(self._approval_configuration())
-            if self.env:
+            if not self.inherit_environment:
+                # The SDK overlays its public default environment on spawn.
+                # Blank missing default keys so no parent values can leak in.
+                merged_env = dict.fromkeys(DEFAULT_INHERITED_ENV_VARS, "") | self.env
+            elif self.env:
                 # Inherit all parent env vars, then override with server config
                 merged_env = {**os.environ, **self.env}
             else:
@@ -215,7 +251,7 @@ class MCPClient:
                 command=self.command,
                 args=self.args,
                 env=merged_env,
-                cwd=os.getcwd(),
+                cwd=self.cwd if self.cwd is not None else os.getcwd(),
             )
 
             # Open log file if needed
@@ -245,7 +281,8 @@ class MCPClient:
                     # only when supported and a level has been requested via
                     # a prior set_logging_level() call.
                     session_kwargs: dict[str, Any] = {
-                        "client_info": build_client_info()
+                        "client_info": build_client_info(),
+                        **session_timeout_kwargs(self.read_timeout_seconds),
                     }
                     if self._log_level is not None and supports_log_level_kwarg():
                         session_kwargs["log_level"] = self._log_level
@@ -270,6 +307,8 @@ class MCPClient:
                             "command": server_params.command, "arguments": server_params.args,
                             "environment": server_params.env, "cwd": server_params.cwd,
                             "protocol": self._protocol_version,
+                            **({"client_options": configuration["client_options"]}
+                               if "client_options" in configuration else {}),
                         })
                         self._circuit_breaker.record_success()
                         self._last_error = None
@@ -407,23 +446,33 @@ class MCPClient:
             _connect, f"connect to {self.server_name}"
         )
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any], *, reconnect: bool = True
+    ) -> Any:
         """
         Call a tool on the MCP server.
 
         Args:
             tool_name: Name of the tool to call
             arguments: Arguments to pass to the tool
+            reconnect: False requires the current session without reconnecting
 
         Returns:
             Tool execution result
         """
         self._require_active()
+        if type(reconnect) is not bool:
+            raise ValueError("MCP reconnect must be a boolean")
+        session = self.session
         check(self, tool_name, arguments)
-        if not self.is_connected or not self.session:
+        if not reconnect:
+            require_same_session(self, session)
+        elif not self.is_connected or not self.session:
             await self.connect()
 
         check(self, tool_name, arguments, consume=True)
+        if not reconnect:
+            require_same_session(self, session)
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
             self._circuit_breaker.record_success()
@@ -512,6 +561,9 @@ class MCPClient:
             return
 
         self.tools = await discover_tools(self.session)
+        if self.discovery == "tools":
+            self.resources, self.prompts = [], []
+            return
         self.resources = await discover_resources(
             self.session, server_name=self.server_name
         )

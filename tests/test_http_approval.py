@@ -9,11 +9,11 @@ import json
 from importlib.metadata import version
 from types import SimpleNamespace
 
+import mcp.client.streamable_http as sdk_http
 import pytest
 import pytest_asyncio
-
-import mcp.client.streamable_http as sdk_http
 from mcp.client.streamable_http import StreamableHTTPTransport
+
 from amplifier_module_tool_mcp import streamable_http_client as product
 from amplifier_module_tool_mcp.sdk_compat import MCPProtocolError
 
@@ -25,6 +25,76 @@ pytestmark = pytest.mark.timeout(10)
 def rpc_method(ctx):
     message = ctx.session_message.message
     return (message.root if SDK_MAJOR == 1 else message).method
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["false", "raise", "cancelled"])
+async def test_owner_veto_at_actual_final_hook_after_queue_and_auth(
+    connected, monkeypatch, failure
+):
+    c, http = connected.client, connected.http
+    guard = c._approval_http
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_hook = guard.hook
+    state = {"current": True}
+
+    def is_current():
+        if not state["current"] and failure == "raise":
+            raise RuntimeError("private-owner-reason")
+        if not state["current"] and failure == "cancelled":
+            raise asyncio.CancelledError("private-owner-reason")
+        return state["current"]
+
+    async def delayed_final_hook(request):
+        if request.method == "POST" and json.loads(request.content).get("method") == "tools/call":
+            entered.set()
+            await release.wait()
+        await original_hook(request)
+
+    # The one real HTTPX request hook remains the guard; add only a finite
+    # pre-guard pause to force owner drift after queue registration/auth.
+    guard.hook = delayed_final_hook
+    http.event_hooks["request"] = [delayed_final_hook]
+    with c.approval_scope(c.approval_binding(), "write", {"value": 1}, is_current=is_current):
+        task = asyncio.create_task(c.call_tool("write", {"value": 1}, reconnect=False))
+        await asyncio.wait_for(entered.wait(), 2)
+        assert guard.pending
+        assert not task.done()  # Scope and task remain active: no cancellation trick.
+        state["current"] = False
+        release.set()
+        with pytest.raises(MCPProtocolError, match="HTTP approval refused before this send") as error:
+            await asyncio.wait_for(task, 2)
+        assert "private-owner-reason" not in str(error.value)
+    assert connected.effects == []
+    assert not guard.pending
+    await c.call_tool("write", {"value": 2}, reconnect=False)
+    state["current"] = True
+    with c.approval_scope(c.approval_binding(), "write", {"value": 3}, is_current=is_current):
+        await c.call_tool("write", {"value": 3}, reconnect=False)
+    assert [e["params"]["arguments"]["value"] for e in connected.effects] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_true_owner_cannot_override_cookie_drift(connected, monkeypatch):
+    c = connected.client
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = StreamableHTTPTransport._handle_post_request
+
+    async def delayed(self, ctx):
+        if rpc_method(ctx) == "tools/call":
+            entered.set()
+            await release.wait()
+        return await original(self, ctx)
+
+    monkeypatch.setattr(StreamableHTTPTransport, "_handle_post_request", delayed)
+    with c.approval_scope(c.approval_binding(), "write", {"value": 1}, is_current=lambda: True):
+        task = asyncio.create_task(c.call_tool("write", {"value": 1}, reconnect=False))
+        await asyncio.wait_for(entered.wait(), 2)
+        connected.http.cookies.set("authority", "changed", domain="fixture.test")
+        release.set()
+        with pytest.raises(MCPProtocolError, match="HTTP approval refused before this send"):
+            await asyncio.wait_for(task, 2)
+    assert connected.effects == []
 
 
 @pytest_asyncio.fixture(params=["legacy", "modern"] if SDK_MAJOR >= 2 else ["legacy"])

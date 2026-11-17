@@ -146,3 +146,64 @@ async def test_http_has_no_reusable_api_and_retains_ordinary_calls():
 async def test_ordinary_calls_do_not_require_approval_policy(connected):
     await connected.client.call_tool('read', {})
     assert connected.session.calls == [('read', {})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['false', 'raise', 'cancelled', 'truthy'])
+async def test_owner_veto_at_entry_and_sdk_admission(connected, failure):
+    client = connected.client
+    state = {'current': False}
+
+    def is_current():
+        if state['current']:
+            return True
+        if failure == 'raise':
+            raise RuntimeError('private-owner-reason')
+        if failure == 'cancelled':
+            raise asyncio.CancelledError('private-owner-reason')
+        return False if failure == 'false' else 1
+
+    binding = client.approval_binding()
+    with pytest.raises(ValueError, match='owner is no longer current') as error:
+        with client.approval_scope(binding, 'write', {}, is_current=is_current):
+            pytest.fail('Invalid owner admitted a scope')
+    assert 'private-owner-reason' not in str(error.value)
+    state['current'] = True
+    with client.approval_scope(binding, 'write', {}, is_current=is_current):
+        state['current'] = False
+        with pytest.raises(ValueError, match='owner is no longer current'):
+            await client.call_tool('write', {}, reconnect=False)
+        state['current'] = True
+        with pytest.raises(ValueError, match='changed'):
+            await client.call_tool('write', {}, reconnect=False)
+    assert not connected.session.calls
+    state['current'] = True
+    with client.approval_scope(binding, 'write', {}, is_current=is_current):
+        await client.call_tool('write', {}, reconnect=False)
+        with pytest.raises(ValueError, match='changed'):
+            await client.call_tool('write', {}, reconnect=False)
+    assert connected.session.calls == [('write', {})]
+
+
+@pytest.mark.asyncio
+async def test_invalid_owner_callback_is_refused(connected):
+    client = connected.client
+    with pytest.raises(ValueError, match='must be callable'):
+        with client.approval_scope(client.approval_binding(), 'write', {}, is_current=True):
+            pytest.fail('Non-callable owner admitted a scope')
+    assert not connected.session.calls
+
+
+@pytest.mark.asyncio
+async def test_async_owner_callback_is_never_scheduled(connected):
+    invoked = []
+
+    async def async_owner():
+        invoked.append(True)
+        return True
+
+    c = connected.client
+    with pytest.raises(ValueError, match='owner is no longer current'):
+        with c.approval_scope(c.approval_binding(), 'write', {}, is_current=async_owner):
+            pytest.fail('Async owner admitted a scope')
+    assert invoked == []
