@@ -136,8 +136,8 @@ async def test_parent_environment_change_does_not_relabel_open_connection(connec
 async def test_http_has_no_reusable_api_and_retains_ordinary_calls():
     client = http.MCPStreamableHTTPClient('fixture', 'https://fixture.invalid/mcp')
     client.session, client._connected = Session(), True
-    assert not hasattr(client, 'approval_binding')
-    assert not hasattr(client, 'approval_scope')
+    with pytest.raises(ValueError, match='no send authorization guard'):
+        client.approval_binding()
     await client.call_tool('read', {})
     assert client.session.calls == [('read', {})]
 
