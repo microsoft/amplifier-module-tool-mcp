@@ -47,40 +47,21 @@ def request_digest(arguments):
     return digest(arguments)
 
 
-def http_state(client):
-    # These are the live public httpx request settings, not the original
-    # constructor dictionary. Unsupported custom auth remains Once-only.
-    if client.auth is not None:
-        raise ValueError("Custom MCP HTTP authentication has no approval binding")
-    return {
-        "headers": list(client.headers.multi_items()),
-        "cookies": [(cookie.domain, cookie.path, cookie.name, cookie.value,
-                     cookie.secure, cookie.expires) for cookie in client.cookies.jar],
-        "trustEnvironment": client.trust_env,
-        "followRedirects": client.follow_redirects,
-        "timeout": client.timeout.as_dict(),
-    }
-
-
 class ConnectionBinding:
-    def __init__(self, client, session, configuration, facts, current_transport=None):
+    def __init__(self, client, session, configuration, facts):
         self.client = client
         self.session = session
         self.configuration = digest(configuration)
         # Retain no credential/environment values in this object or diagnostics.
         self.fingerprint = digest(facts)
         self.protocol = facts.get("protocol")
-        self.current_transport = current_transport
 
     def describe(self, configuration):
         if (self.client.session is not self.session or not self.client.is_connected
                 or self.client._retired or digest(configuration) != self.configuration
                 or not self.protocol or self.client._protocol_version != self.protocol):
             raise ValueError("The MCP approval connection is no longer current")
-        return {"version": 1, "key": digest({
-            "connection": self.fingerprint,
-            "current": self.current_transport() if self.current_transport else None,
-        })}
+        return {"version": 1, "key": self.fingerprint}
 
 
 @contextmanager
